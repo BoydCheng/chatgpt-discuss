@@ -66,7 +66,9 @@ function Ensure-ChatTab {
   Invoke-WB "navigate" @{ url = $CHAT_HOME; newTab = $true; group_title = "GPT讨论：文档体检" } $Session | Out-Null
   Start-Sleep -Seconds 6
   for ($i = 0; $i -lt 20; $i++) {
-    try { $v = Eval-JS "!!document.querySelector('#prompt-textarea')" $Session; if ($v -eq $true -or "$v" -eq "true") { return $true } } catch {}
+    # 与 ask-gpt.ps1 同一套多候选定位：未登录/新版页面的 composer 不是 #prompt-textarea
+    $probe = '(()=>{const v=e=>{try{const r=e.getBoundingClientRect();return r.width>0&&r.height>0}catch(_){return false}};for(const s of ["#prompt-textarea","div[contenteditable=\"true\"]#prompt-textarea","form .ProseMirror[contenteditable=\"true\"]","form [contenteditable=\"true\"]","main [contenteditable=\"true\"]","form textarea","textarea"]){const e=document.querySelector(s);if(e&&v(e)&&!e.disabled&&!e.readOnly)return true}return false})()'
+    try { $v = Eval-JS $probe $Session; if ($v -eq $true -or "$v" -eq "true") { return $true } } catch {}
     Start-Sleep -Milliseconds 1500
   }
   return $false
@@ -130,10 +132,10 @@ foreach ($root in $Roots) {
       if ($_.FullName -notlike $Only) { return }
       $txt = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
       $cid = $null
-      $mk = [regex]::Match($txt, 'chatgpt-discuss:.*?conv=https://chatgpt\.com/c/([0-9a-zA-Z\-]{8,})')
+      $mk = [regex]::Match($txt, 'chatgpt-discuss:.*?conv=https://chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
       if ($mk.Success) { $cid = $mk.Groups[1].Value }
       if (-not $cid) {
-        $lm = [regex]::Match($txt.Substring(0, [Math]::Min(3000, $txt.Length)), 'chatgpt\.com/c/([0-9a-zA-Z\-]{8,})')
+        $lm = [regex]::Match($txt.Substring(0, [Math]::Min(3000, $txt.Length)), 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
         if ($lm.Success) { $cid = $lm.Groups[1].Value }
       }
       # 分类：脚本型（脚本自动落盘，含 **Q:** / **A:**）vs 汇总型（AI 手工整理，含要点/完整原文）

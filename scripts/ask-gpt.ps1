@@ -114,20 +114,39 @@ function Fail {
   exit $Code
 }
 
+# 会话路径种类：c = 登录会话（有持久身份，可用 URL 找回）；
+# uc = 匿名（未登录）会话——**关掉即失效**：URL 只在对话未关时有效，
+# 拿它重开只会得到一条新对话，所以匿名会话绝不能走"用 URL 重开"的恢复路径。
+$script:ConvKind = 'c'
+function Get-ConvKind {
+  param([string]$Url)
+  if ($Url -and $Url -match 'chatgpt\.com/uc/') { return 'uc' }
+  return 'c'
+}
+function Set-ConvKindFromUrl {
+  param([string]$Url)
+  if ($Url) { $script:ConvKind = Get-ConvKind $Url }
+}
+function New-ConvUrl {
+  param([string]$Id)
+  return "https://chatgpt.com/$($script:ConvKind)/$Id"
+}
 function Get-ConvId {
   param([string]$Url)
   if (-not $Url) { return $null }
-  $m = [regex]::Match($Url, 'chatgpt\.com/c/([0-9a-zA-Z\-]{8,})')
+  $m = [regex]::Match($Url, 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
   if ($m.Success) { return $m.Groups[1].Value }
-  $m = [regex]::Match($Url, 'chat\.openai\.com/c/([0-9a-zA-Z\-]{8,})')
+  $m = [regex]::Match($Url, 'chat\.openai\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
   if ($m.Success) { return $m.Groups[1].Value }
   return $null
 }
 function Get-CanonicalConvUrl {
   param([string]$Url)
   $id = Get-ConvId $Url
-  if ($id) { return "https://chatgpt.com/c/$id" }
-  return $null
+  if (-not $id) { return $null }
+  # 规范化锚点的同时同步会话种类（本脚本是单线程流程，锚点种类即全局事实）
+  $script:ConvKind = Get-ConvKind $Url
+  return "https://chatgpt.com/$($script:ConvKind)/$id"
 }
 
 # ============================ 状态（SSOT） ============================
@@ -443,13 +462,19 @@ function Resolve-ConvTab {
       try { $href = Eval-JS "location.href" $S; if ((Get-ConvId $href) -eq $ConvId) { return $t } } catch {}
     }
     if ($round -lt $MaxRecover) {
+      if ($script:ConvKind -eq 'uc') {
+        # 匿名会话的 URL 不是身份：拿它重开只会得到一条新对话，
+        # 那正是本 skill 最忌讳的"把同一条讨论撕成两条"。到此为止，由调用方报错。
+        Write-Warning "匿名会话的标签已不在，且匿名会话无法用 URL 找回（关掉即新对话）"
+        return $null
+      }
       Write-Warning "没有可用的锚定标签，用 convUrl 重开（$($round + 1)/$MaxRecover）"
       # 不传 newTab：让 webbridge 复用当前标签（没有才新建），避免标签堆积
-      try { Invoke-WB "navigate" @{ url = "https://chatgpt.com/c/$ConvId"; group_title = $Group } $S | Out-Null } catch {}
+      try { Invoke-WB "navigate" @{ url = (New-ConvUrl $ConvId); group_title = $Group } $S | Out-Null } catch {}
       $dl = (Get-Date).AddSeconds(30)
       while ((Get-Date) -lt $dl) {
         Start-Sleep -Milliseconds 1200
-        try { $h = Eval-JS "location.href" $S; if ((Get-ConvId $h) -eq $ConvId) { return @{ url = "https://chatgpt.com/c/$ConvId"; tabId = $null } } } catch {}
+        try { $h = Eval-JS "location.href" $S; if ((Get-ConvId $h) -eq $ConvId) { return @{ url = (New-ConvUrl $ConvId); tabId = $null } } } catch {}
       }
     }
   }
@@ -587,7 +612,9 @@ if ($Attach) {
     $aid = $hits[0].id
     Write-Warning "Attach: '$Attach' → $($hits[0].title)  [$aid]"
   }
-  $ConvUrl = "https://chatgpt.com/c/$aid"   # 交给下面的锚点解析（优先级最高）
+  # 直接给 URL 时保留其路径种类（/uc/ 匿名会话不能被改写成 /c/）；
+  # 裸 id 与标题匹配只可能来自登录会话（匿名会话不在账号列表里），故默认 /c/。
+  $ConvUrl = if ($Attach -match 'chatgpt\.com/(?:c|uc)/') { (Get-CanonicalConvUrl $Attach) } else { "https://chatgpt.com/c/$aid" }   # 交给下面的锚点解析（优先级最高）
 }
 
 # ============================ -Status（只读） ============================
@@ -688,9 +715,9 @@ if (-not $anchor) {
   $txt = Read-Text $DocPath
   if ($txt) {
     $head = if ($txt.Length -gt 2000) { $txt.Substring(0, 2000) } else { $txt }
-    $m = [regex]::Match($head, 'chatgpt\.com/c/([0-9a-zA-Z\-]{8,})')
+    $m = [regex]::Match($head, 'chatgpt\.com/(c|uc)/([0-9a-zA-Z\-]{8,})')
     if ($m.Success) {
-      $anchor = "https://chatgpt.com/c/$($m.Groups[1].Value)"
+      $anchor = "https://chatgpt.com/$($m.Groups[1].Value)/$($m.Groups[2].Value)"
       $anchorSrc = "文档(旧格式链接)"
       Write-Warning "该文档无 chatgpt-discuss 标记（v1 产物），已从正文认领会话链接作锚点: $anchor"
     }
@@ -712,6 +739,24 @@ if ($anchor -and ($New -and -not $ForceNew)) {
   确实要开新线程  : 加 -ForceNew（旧链接会归档进 state 的 convHistory）
   想看看都有哪些   : pwsh -File ask-gpt.ps1 -Status
 "@
+}
+
+# 无锚点时，先认领本讨论组里已有的 chatgpt 标签：匿名会话**离开即失效**，
+# 导航到根路径等于把上一轮丢掉。显式 -New / -ForceNew 才表示"确实要开新对话"。
+$script:ReuseTab = $null
+if (-not $anchor -and -not $New -and -not $ForceNew) {
+  foreach ($t in (Get-SessionChatGptTabs $Session)) {
+    if (Get-ConvId $t.url) {
+      $anchor = Get-CanonicalConvUrl $t.url
+      $anchorSrc = "已有标签(未导航)"
+      Write-Warning "本讨论组已有会话标签，认作锚点（不导航，保持对话）: $anchor"
+    } else {
+      $anchorSrc = "已有标签(新对话页)"
+      Write-Warning "本讨论组已有 chatgpt 标签但尚未产生会话，原地复用不导航: $($t.url)"
+    }
+    $script:ReuseTab = $t.url
+    break
+  }
 }
 
 $creating = (-not $anchor) -or $ForceNew
@@ -808,10 +853,16 @@ if ($creating) {
   Write-Warning "打开 chatgpt.com 新建对话（标签组: $GroupTitle）"
   # 本 session 已有标签就复用（不传 newTab），避免同一讨论组里堆出多个标签
   $existing = Get-SessionChatGptTabs $Session
-  $navArgs = @{ url = $CHAT_HOME }
-  if ($existing.Count -eq 0) { $navArgs.newTab = $true; $navArgs.group_title = $GroupTitle }
-  else { Write-Warning "（复用本讨论已有标签，未新开）" }
-  try { Invoke-WB "navigate" $navArgs $Session | Out-Null } catch { Fail 6 "navigate 失败: $($_.Exception.Message)" }
+  if ($script:ReuseTab) {
+    # 已有 chatgpt 标签（还没产生会话）：**原地复用，不导航**——匿名会话离开即变新对话
+    Write-Warning "复用已有标签（不导航）: $($script:ReuseTab)"
+    try { Invoke-WB "find_tab" @{ url = $script:ReuseTab } $Session | Out-Null } catch {}
+  } else {
+    $navArgs = @{ url = $CHAT_HOME }
+    if ($existing.Count -eq 0) { $navArgs.newTab = $true; $navArgs.group_title = $GroupTitle }
+    else { Write-Warning "（复用本讨论已有标签，未新开）" }
+    try { Invoke-WB "navigate" $navArgs $Session | Out-Null } catch { Fail 6 "navigate 失败: $($_.Exception.Message)" }
+  }
   if (-not (Wait-Composer $Session 45)) { Fail 5 "ChatGPT 页面未就绪（45s 内没看到输入框）——可能是登录墙/验证码/改版" }
   # 只有在"落在某条已有会话上"时才点新对话；根路径本身就是新对话，点了反而多余
   try {
@@ -837,7 +888,7 @@ if ($creating) {
   $tab = $null
   $borrowedThisRound = $false
   try {
-    $bt = Invoke-WB "find_tab" @{ url = "https://chatgpt.com/c/$convId"; active = $true } $Session
+    $bt = Invoke-WB "find_tab" @{ url = (New-ConvUrl $convId); active = $true } $Session
     if ($bt.ok -and $bt.data.success) {
       Start-Sleep -Milliseconds 400
       $href = Eval-JS "location.href" $Session
@@ -975,10 +1026,13 @@ while ((Get-Date) -lt $deadline) {
     $apiErr++
     if ($apiErr -le 2) { Write-Warning ("读取会话失败: " + $(if ($st) { $st.error } else { "无响应" })) }
     # 读不到（标签丢了 / 页面在导航）→ 限量恢复，绝不在循环里反复开标签
-    if ($recoverCount -lt $MaxRecover -and ((Get-Date) - $lastRecover).TotalSeconds -gt 20) {
+    if ($script:ConvKind -eq 'uc') {
+      # 匿名会话的 URL 不是身份：重开只会得到一条新对话，所以只报告、不恢复
+      if ($apiErr -le 3) { Write-Warning "读取会话失败；匿名会话无法用 URL 找回（关掉即新对话），不重开标签" }
+    } elseif ($recoverCount -lt $MaxRecover -and ((Get-Date) - $lastRecover).TotalSeconds -gt 20) {
       $recoverCount++; $lastRecover = Get-Date
       Write-Warning "标签读不到，用 convUrl 重开（$recoverCount/$MaxRecover）"
-      try { Invoke-WB "navigate" @{ url = "https://chatgpt.com/c/$convId"; group_title = $GroupTitle } $Session | Out-Null } catch {}
+      try { Invoke-WB "navigate" @{ url = (New-ConvUrl $convId); group_title = $GroupTitle } $Session | Out-Null } catch {}
       Start-Sleep -Seconds 2
     }
     continue
@@ -1003,7 +1057,7 @@ if (-not $answer) {
 if (-not $answer) {
   if ($creating) {
     # 新建轮即使没拿到回答，也要把锚点固化，避免下一轮又开新对话
-      $captured = if ($convId) { "https://chatgpt.com/c/$convId" } else { $null }
+      $captured = if ($convId) { (New-ConvUrl $convId) } else { $null }
       if ($captured) {
         Write-Utf8 (Get-StatePath $Session) (@{
           session = $Session; convUrl = $captured; convHistory = @(); docPath = $DocPath; title = $Title
@@ -1028,7 +1082,7 @@ if (-not $answer) {
 
 # ============================ 6. 写文档 + 固化状态 ============================
 
-$anchorFinal = if ($convId) { "https://chatgpt.com/c/$convId" } elseif ($anchor) { $anchor } else { "unknown" }
+$anchorFinal = if ($convId) { (New-ConvUrl $convId) } elseif ($anchor) { $anchor } else { "unknown" }
 
 Ensure-Dir (Split-Path $DocPath -Parent)
 $round = (Get-DocRoundCount $DocPath) + 1
