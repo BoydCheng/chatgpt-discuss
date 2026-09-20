@@ -1,0 +1,4 @@
+# 运行期状态不在此目录（见 %LOCALAPPDATA%\chatgpt-discuss\state），
+# 这里只防临时/日志文件误入版本库。
+*.tmp
+*.log
