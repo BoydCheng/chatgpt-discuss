@@ -200,8 +200,11 @@ Select-String -Path <文档> -Pattern 'chatgpt-discuss: .*conv=(\S+)'   # 从文
 curl.exe -s --noproxy "*" http://127.0.0.1:10086/status
 # 2) 回到原会话（用上面拿到的链接；group_title 用原值）
 #    {"action":"navigate","args":{"url":"https://chatgpt.com/c/<uuid>","newTab":true},"session":"<session>"}
-# 3) fill:  {"action":"fill","args":{"selector":"#prompt-textarea","value":"<问题>"},"session":"<session>"}
-# 4) 发送: {"action":"click","args":{"selector":"button[data-testid=\"send-button\"]"},"session":"<session>"}
+# 3) 定位对话框：**不要写死 #prompt-textarea**（未登录/新版页面没有它，见「限制」）。先探测：
+#    evaluate "(()=>{const v=e=>{try{const r=e.getBoundingClientRect();return r.width>0&&r.height>0}catch(_){return false}};for(const s of ['#prompt-textarea','form [contenteditable=\"true\"]','form textarea','textarea']){const e=document.querySelector(s);if(e&&v(e))return s}return ''})()"
+#    再用它返回的选择器 fill: {"action":"fill","args":{"selector":"<探测结果>","value":"<问题>"},"session":"<session>"}
+# 4) 发送: {"action":"click","args":{"selector":"button[aria-label*=\"发送\"]"},"session":"<session>"}
+#    （未登录/新版页面没有 button[data-testid="send-button"]；中文界面用「发送」，英文界面换 Send）
 # 5) 等完成: 轮询 evaluate "!!document.querySelector('button[data-testid=\"stop-button\"]')" 直到 false
 # 6) 取答:   evaluate "[...document.querySelectorAll('[data-message-author-role=\"assistant\"]')].pop()?.innerText"
 ```
@@ -269,7 +272,16 @@ webbridge 的 `list_tabs` / `find_tab` 返回的是**它自己的认知**，不�
 
 ## 限制
 
-- 依赖 ChatGPT 网页 DOM：`#prompt-textarea`、`button[data-testid="send-button"]`、`button[data-testid="stop-button"]`、`[data-message-author-role="assistant"]`。UI 改版时需同步更新脚本
+- **对话框与发送键走多候选定位，不押单一选择器**（2026-09-20 实测修正）。composer 依次试
+  `#prompt-textarea` → `div[contenteditable]#prompt-textarea` → `form .ProseMirror[contenteditable]`
+  → `form`/`main [contenteditable]` → `form textarea` → `textarea`，全落空时退到"页面上最后一个可见可编辑元素"；
+  发送键依次试 `button[data-testid="send-button"]` → `aria-label` 含 Send/发送 → `form button[type=submit]`，
+  兜底取 composer 所在容器内最后一个可见且未禁用的按钮（排除语音/附件/工具键）。
+  命中后打 `data-cc-composer` / `data-cc-send` 标记再操作。**改版时只需扩充这两个候选列表**
+  （`Resolve-ComposerTarget` / `Resolve-SendTarget`）。
+  实测：未登录首页的 composer 是 `textarea#mobile-composer-prompt`，既无 `#prompt-textarea` 也无
+  `button[data-testid="send-button"]` —— 写死选择器的旧版在该页面必然失败
+- **发送键必须在填完内容之后再定位**：输入框为空时 ChatGPT 把发送键换成语音按钮，那一刻"最后一个按钮"不是发送键
 - 仅文本问答；不做图像生成/上传文件
 - **答案读取走后端接口，不抓 DOM**（2026-09-14 实测修正）：DOM `innerText` 只拿得到第一段
   （27/163、52/582 字符），会**丢掉 80~95% 正文**。脚本改为读

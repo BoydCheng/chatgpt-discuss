@@ -337,11 +337,84 @@ function Get-LastAnswerText {
   try { return Eval-JS '(()=>{const els=document.querySelectorAll("[data-message-author-role=\"assistant\"]");const el=els[els.length-1];return el?el.innerText:""})()' $S }
   catch { return $null }
 }
+function Resolve-ComposerTarget {
+  # 定位对话框并打标记 data-cc-composer，返回命中描述（空串 = 没找到）。
+  # 不押单一选择器：composer 在登录/未登录、新旧版之间结构不同
+  # （textarea#prompt-textarea ↔ ProseMirror contenteditable），写死一个必然脆。
+  # 候选按"最具体 → 最通用"排序；全落空时退到"页面上最后一个可见可编辑元素"。
+  param([string]$S)
+  $js = @'
+(()=>{
+  const vis = e => { try { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 } catch(_) { return false } };
+  document.querySelectorAll('[data-cc-composer]').forEach(e => e.removeAttribute('data-cc-composer'));
+  const ok = e => e && vis(e) && !e.disabled && !e.readOnly;
+  const cands = [
+    '#prompt-textarea',
+    'div[contenteditable="true"]#prompt-textarea',
+    'form .ProseMirror[contenteditable="true"]',
+    'form [contenteditable="true"]',
+    'main [contenteditable="true"]',
+    'form textarea',
+    'textarea'
+  ];
+  let el = null;
+  for (const c of cands) {
+    try { const e = document.querySelector(c); if (ok(e)) { el = e; break } } catch(_) {}
+  }
+  if (!el) {
+    const all = [...document.querySelectorAll('[contenteditable="true"],textarea')].filter(ok);
+    el = all.length ? all[all.length - 1] : null;
+  }
+  if (!el) return '';
+  el.setAttribute('data-cc-composer', '1');
+  return el.tagName.toLowerCase() + (el.getAttribute('contenteditable') === 'true' ? '/ce' : '/val');
+})()
+'@
+  try { $v = Eval-JS $js $S; if ($v) { return [string]$v } } catch {}
+  return ''
+}
+function Resolve-SendTarget {
+  # 定位发送按钮并打标记 data-cc-send，返回命中描述（空串 = 没找到）。
+  # **必须在填完内容之后调用**：输入框为空时 ChatGPT 把发送键换成语音按钮，
+  # 那一刻"最后一个按钮"并不是发送键。
+  param([string]$S)
+  $js = @'
+(()=>{
+  const vis = e => { try { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 } catch(_) { return false } };
+  document.querySelectorAll('[data-cc-send]').forEach(e => e.removeAttribute('data-cc-send'));
+  const cands = [
+    'button[data-testid="send-button"]',
+    'button[aria-label*="Send"]',
+    'button[aria-label*="发送"]',
+    'form button[type="submit"]'
+  ];
+  let el = null;
+  for (const c of cands) {
+    try { const e = document.querySelector(c); if (e && vis(e) && !e.disabled) { el = e; break } } catch(_) {}
+  }
+  if (!el) {
+    const comp = document.querySelector('[data-cc-composer]') || document.querySelector('#prompt-textarea');
+    const scope = comp ? (comp.closest('form') || comp.parentElement) : null;
+    if (scope) {
+      const skip = /voice|dictat|microphone|attach|upload|tool|语音|话筒|附件|上传|工具/i;
+      const btns = [...scope.querySelectorAll('button')].filter(b =>
+        vis(b) && !b.disabled && !skip.test(b.getAttribute('aria-label') || ''));
+      el = btns.length ? btns[btns.length - 1] : null;
+    }
+  }
+  if (!el) return '';
+  el.setAttribute('data-cc-send', '1');
+  return (el.getAttribute('aria-label') || el.getAttribute('data-testid') || el.tagName.toLowerCase());
+})()
+'@
+  try { $v = Eval-JS $js $S; if ($v) { return [string]$v } } catch {}
+  return ''
+}
 function Wait-Composer {
   param([string]$S, [int]$Seconds = 45)
   $deadline = (Get-Date).AddSeconds($Seconds)
   while ((Get-Date) -lt $deadline) {
-    try { $v = Eval-JS "!!document.querySelector('#prompt-textarea')" $S; if ($v -eq $true -or "$v" -eq "true") { return $true } } catch {}
+    if (Resolve-ComposerTarget $S) { return $true }
     Start-Sleep -Milliseconds 1500
   }
   return $false
@@ -825,21 +898,33 @@ if ($convId) {
 $a0text = ''
 try { $t0 = Get-LastAnswerText $Session; if ($t0) { $a0text = [string]$t0 } } catch {}
 
+$compSel = '[data-cc-composer="1"]'
 $fill = $null
-try { $fill = Invoke-WB "fill" @{ selector = "#prompt-textarea"; value = $Question } $Session } catch {}
+if (Resolve-ComposerTarget $Session) {
+  try { $fill = Invoke-WB "fill" @{ selector = $compSel; value = $Question } $Session } catch {}
+}
 if (-not $fill -or -not $fill.success) {
-  try { Invoke-WB "click" @{ selector = "#prompt-textarea" } $Session | Out-Null } catch {}
-  Start-Sleep -Milliseconds 800
-  try { $fill = Invoke-WB "fill" @{ selector = "#prompt-textarea"; value = $Question } $Session } catch {}
+  # 首填失败：重新探测一次（标记可能被重渲染冲掉），聚焦后再填
+  if (Resolve-ComposerTarget $Session) {
+    try { Invoke-WB "click" @{ selector = $compSel } $Session | Out-Null } catch {}
+    Start-Sleep -Milliseconds 800
+    try { $fill = Invoke-WB "fill" @{ selector = $compSel; value = $Question } $Session } catch {}
+  }
 }
-if (-not $fill -or -not $fill.success) { Fail 7 "填入问题失败（#prompt-textarea 不可用，可能是页面改版）" }
+if (-not $fill -or -not $fill.success) { Fail 7 "填入问题失败（对话框定位不到，可能是页面改版）" }
 
+$sendSel = '[data-cc-send="1"]'
 $sent = $false
-try { $clk = Invoke-WB "click" @{ selector = 'button[data-testid="send-button"]' } $Session; $sent = [bool]$clk.success } catch {}
-if (-not $sent) {
-  try { $v = Eval-JS '(()=>{const b=document.querySelector("button[data-testid=\"send-button\"]");if(b){b.click();return true}return false})()' $Session; $sent = ($v -eq $true -or "$v" -eq "true") } catch {}
+if (Resolve-SendTarget $Session) {
+  try { $clk = Invoke-WB "click" @{ selector = $sendSel } $Session; $sent = [bool]$clk.success } catch {}
 }
-if (-not $sent) { Fail 8 "点发送按钮失败（selector 可能改版，用 snapshot 找发送按钮）" }
+if (-not $sent) {
+  # 重探一次：填字后按钮可能刚从"语音"换成"发送"，重渲染会冲掉上一次标记
+  if (Resolve-SendTarget $Session) {
+    try { $v = Eval-JS '(()=>{const b=document.querySelector("[data-cc-send=\"1\"]");if(b){b.click();return true}return false})()' $Session; $sent = ($v -eq $true -or "$v" -eq "true") } catch {}
+  }
+}
+if (-not $sent) { Fail 8 "点发送按钮失败（按钮定位不到，可能是页面改版）" }
 
 Activate-EdgeWindow | Out-Null
 
