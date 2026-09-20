@@ -59,6 +59,7 @@
   11  发送前校验失败：当前页面不是锚定会话
   12  同一 session 已有另一个 ask-gpt 进程在跑（防止双开导致同一对话被并发写）
   13  参数/文档冲突
+  14  登录态与会话种类不匹配（锚定的是登录会话 /c/，但当前未登录，打不开）
 .EXAMPLE
   pwsh -File ask-gpt.ps1 -Question "请介绍Modbus" -Session modbus-101 -New -Title "Modbus 入门"
 .EXAMPLE
@@ -304,6 +305,24 @@ function Eval-JS {
   param([string]$Code, [string]$SessionName)
   $d = Invoke-WB "evaluate" @{ code = $Code } $SessionName
   return $d.value
+}
+function Get-LoginState {
+  # 探测当前 ChatGPT 页面的登录态：/api/auth/session 带 user.id 即已登录。
+  # 它只用于"开场判断与告知"，**不**决定恢复策略——恢复策略以锚点的会话种类
+  # （/c/ 登录会话 vs /uc/ 匿名会话）为准，那是事实，而登录态可能中途变化。
+  param([string]$S)
+  $js = @'
+(async()=>{
+  try{
+    const r = await fetch('/api/auth/session', {credentials:'include'});
+    if(!r.ok) return 'unknown';
+    const j = await r.json();
+    return (j && j.user && j.user.id) ? 'in' : 'out';
+  }catch(e){ return 'unknown' }
+})()
+'@
+  try { $v = Eval-JS $js $S; if ($v) { return [string]$v } } catch {}
+  return 'unknown'
 }
 function Get-SessionChatGptTabs {
   param([string]$S)
@@ -579,8 +598,10 @@ function Connect-ChatList {
 if ($ListChats) {
   Connect-ChatList -Base $Daemon -Reason "-ListChats" | Out-Null
   $chats = Get-ServerChats -S $script:ScanSession -Limit $Limit
-  if (-not $chats) { Fail 9 "取会话列表失败（返回为空）" }
-  if ($chats.error) { Fail 5 ("取会话列表失败: " + $chats.error) }
+  # 账号会话列表需要登录态；未登录时匿名会话（/uc/）也不在这个列表里，
+  # 所以 -ListChats 与按标题 -Attach 在未登录下没有意义——给可行动的提示，而不是裸错误码。
+  if (-not $chats) { Fail 9 "取会话列表失败（返回为空）——账号会话列表需要登录态；未登录时匿名会话不在其中" }
+  if ($chats.error) { Fail 5 ("取会话列表失败: " + $chats.error + "——该列表需要登录态；未登录时匿名会话不在其中。可直接用 -Attach <完整 /uc/ 链接> 接管开着的匿名标签") }
   $tot = if ($null -ne $chats.total) { $chats.total } else { "?" }
   Write-Output ("ChatGPT 账号内共 $tot 条会话，按更新时间倒序显示前 $($chats.count) 条：")
   Write-Output ""
@@ -941,6 +962,25 @@ if ($convId) {
   if (-not $ok) {
     Fail 11 "发送前校验失败：当前页面 '$href' 不是锚定会话 $anchor。已中止，避免把问题发进别的对话。请检查该标签是否被手动导航走了（不要用 -New 绕开）"
   }
+}
+
+# ==================== 3.5 登录态 × 会话种类（分支判定） ====================
+#
+# 登录态决定"这条会话能不能打开"，会话种类（锚点路径）决定"能不能重开"。
+# 两者交叉出四种情况，必须分开处理：匿名会话重开即新对话，
+# 而登录会话在未登录态根本打不开（会撞登录页）。
+$login = Get-LoginState $Session
+$modeName = switch ($login) { 'in' { '已登录' } 'out' { '未登录(匿名)' } default { '登录态未知' } }
+$kindName = if ($convId) { "/$($script:ConvKind)/" } else { "待定（本轮新建，发送后才定）" }
+Write-Warning "登录态: $modeName | 会话种类: $kindName"
+if ($login -eq 'out' -and $convId -and $script:ConvKind -eq 'c') {
+  Fail 14 "锚定的是登录会话 $anchor，但当前未登录——登录会话在未登录态打不开（会跳登录页）。请先在 Edge 登录 ChatGPT 再重试；或改用 -New 开一条匿名讨论（匿名会话关掉即失效）。"
+}
+if ($login -eq 'in' -and $script:ConvKind -eq 'uc') {
+  Write-Warning "本讨论是匿名会话（/uc/）：登录后它可能不再可访问。本轮仍按匿名策略处理——只原地复用、绝不重开。"
+}
+if ($login -eq 'out' -and -not $convId) {
+  Write-Warning "当前未登录：本轮走**匿名会话**（/uc/）——关掉标签即失效、不能跨天。要长期/跨天讨论请先在 Edge 登录 ChatGPT。"
 }
 
 # ============================ 4. 填入 + 发送 ============================
