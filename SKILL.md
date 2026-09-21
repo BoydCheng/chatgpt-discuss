@@ -205,6 +205,39 @@ pwsh -File tools\set-intelligence.ps1 -Model 5.6      # 换模型（部分匹配
 
 ---
 
+## 附：发问接口字段参考（2026-09 抓包实测）
+
+发问走 `POST /backend-api/f/conversation`（注意有 `/f/` 前缀，且有配套的 `/prepare` 步骤）。抓包得到的关键字段：
+
+```jsonc
+{
+  "action": "next",
+  "messages": [ { "author": {"role":"user"}, "content": {"content_type":"text","parts":["..."]} } ],
+  "conversation_id": "...",        // 续聊时带
+  "parent_message_id": "...",
+  "model": "gpt-5-6-thinking",     // ← 模型
+  "thinking_effort": "standard",   // ← 思考强度（standard=「中」档）
+  "conversation_mode": {"kind":"primary_assistant"},
+  "model_response_contracts": [...],   // 一堆客户端契约
+  "client_contextual_info": {...}      // 屏幕/时区/暗色模式等
+}
+```
+
+**模型与思考强度确实是请求体字段**（不是只能点 UI）。`thinking_effort` 实测映射：`standard`=「中」档（其余档位的字符串未逐档抓包确认）。
+
+### 为什么仍走 UI 操作，而不是裸发接口
+
+抓包确认了模型/强度在请求体里，但**不推荐绕开 UI 直接发 POST**：
+
+1. **body 字段多且有隐性依赖**：真实 body 带 `model_response_contracts`、`client_contextual_info`、`supported_encodings`、`conduit_token` 等十几个字段，缺一个或顺序不对就可能被拒或行为异常。手工构造是在跟一个会变的服务端格式赛跑。
+2. **页面自己会打包**：UI 设置（模型/强度菜单）之后，前端发问时自动把当前设置填进 body——让页面做这个打包，比脚本去复制整个 body 结构稳定得多。
+3. **可观测**：UI 操作发生在真实浏览器里，能直接看到/复核；裸发接口是黑盒。
+4. **抗改版**：UI 菜单结构变了还能用 CDP 定位元素；裸 body 字段一旦服务端调整就得重新逆向。
+
+所以 `set-intelligence.ps1` 走 CDP 点 UI、ask-gpt 让页面自己发问，是**刻意的取舍**，不是没注意到接口。抓包的价值是**确认模型/强度确实进了请求体**（为将来真要绕开 UI 留一份字段参考），而不是现在绕开。
+
+---
+
 ## 前置条件
 
 - Kimi WebBridge daemon 运行中（`kimi-webbridge start` 启动）。地址**自动探测**：
