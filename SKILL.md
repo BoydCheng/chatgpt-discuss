@@ -135,6 +135,7 @@ pwsh -File ...\ask-gpt.ps1 -Attach <uuid> -Session rigol-perf
 | `-ForceNew` | 确认放弃原线程、开新的（旧链接归档进 `convHistory`） |
 | `-Status` | 只读列出所有讨论（session / 轮数 / 会话链接 / 文档），不碰浏览器 |
 | `-CloseExtras` | 清理该 session 内不属于本讨论的 chatgpt 标签（清理历史残留用） |
+| `-ConfirmIntensity` | 确认当前思考强度。`即时`/`Pro` 档会被拦下提醒（exit 15），加此参数表示用户已确认继续；本会话记住该档位，同档位后续不再拦 |
 | `-ConvUrl` | 显式指定要锚定的已有会话（接管/恢复用） |
 | `-ListChats` | **只读**列出 ChatGPT 账号里的会话（标题 / id / 更新时间 / 本地锚定情况）。不提问、不改文档 |
 | `-Attach` | 把**已存在的会话**挂到当前讨论：标题关键字（模糊）、完整链接、或裸 id 都行。不带 `-Question` 时只绑定 |
@@ -164,6 +165,27 @@ pwsh -File ...\ask-gpt.ps1 -Attach <uuid> -Session rigol-perf
 | 12 | 同一 session 已有进程在跑 | 等它跑完，**不要**并发/不要换 session 名绕开 |
 | 13 | 参数/文档冲突 | 按报错信息修正参数 |
 | 14 | 登录态与会话种类不匹配（锚定 `/c/` 登录会话，但当前未登录） | 先在 Edge 登录 ChatGPT 再重试；或 `-New` 开一条匿名讨论（易失） |
+| 15 | 思考强度处于极端档（即时/Pro）且未确认 | 难问题用「即时」效果差、简单问题用「Pro」浪费。确认继续就重跑并加 `-ConfirmIntensity`（本会话记住该档位）；要换档用 `tools\set-intelligence.ps1 -Thinking <档位>` |
+
+---
+
+## 模型与思考强度（登录态）
+
+登录态下 composer 里有「模型+思考强度」合并菜单（匿名会话没有）。**思考强度是滑块**，档位（实测 2026-09-20）：
+
+`0=即时 · 1=中 · 2=高 · 3=极高 · 4=Pro`
+
+**提问前脚本自动检查强度**：处于「即时」或「Pro」这两个极端档时拦下提醒（exit 15）——即时档不深思、难问题容易答浅；Pro 档成本高、简单问题浪费。确认继续就加 `-ConfirmIntensity`（本会话记住，同档位不再提醒）。
+
+**调整工具**：`tools\set-intelligence.ps1`（只改设置、不发消息、不耗对话额度）
+
+```powershell
+pwsh -File tools\set-intelligence.ps1                 # 只读显示当前
+pwsh -File tools\set-intelligence.ps1 -Thinking 中    # 调思考强度（档位名或 0-4）
+pwsh -File tools\set-intelligence.ps1 -Model 5.6      # 换模型（部分匹配）
+```
+
+**使用约定**：**只在用户明确要求时才调整**——脚本与 AI 都不自作主张切换模型/强度；提问前的检查是"提醒"，不是"自动改"。让 AI 自主按问题难度选强度是后续方向，当前不做。
 
 ---
 

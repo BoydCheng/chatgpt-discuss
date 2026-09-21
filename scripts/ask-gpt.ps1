@@ -60,6 +60,7 @@
   12  同一 session 已有另一个 ask-gpt 进程在跑（防止双开导致同一对话被并发写）
   13  参数/文档冲突
   14  登录态与会话种类不匹配（锚定的是登录会话 /c/，但当前未登录，打不开）
+  15  思考强度处于极端档（即时/Pro）且未确认——难问题用即时效果差、简单问题用 Pro 浪费
 .EXAMPLE
   pwsh -File ask-gpt.ps1 -Question "请介绍Modbus" -Session modbus-101 -New -Title "Modbus 入门"
 .EXAMPLE
@@ -84,7 +85,8 @@ param(
   [string]$Daemon = "",   # 留空 = 自动探测（daemon.addr → 默认 10086）
   [switch]$ListChats,     # 只读：列出 ChatGPT 账号里的会话（标题 / id / 更新时间 / 本地锚定情况）
   [string]$Attach = "",   # 把"已存在的会话"挂到当前讨论：给标题关键字，或直接给 /c/<id>
-  [int]$Limit = 30        # -ListChats 显示多少条
+  [int]$Limit = 30,       # -ListChats 显示多少条
+  [switch]$ConfirmIntensity   # 确认当前思考强度（即时/Pro 档会被拦下提醒，加此参数表示用户已确认继续）
 )
 
 $ErrorActionPreference = "Stop"
@@ -584,6 +586,7 @@ if ($Attach -and -not $Question) {
   Write-DiscussState $Session (@{
     session = $Session; convUrl = $anchor; convHistory = $hist; docPath = $DocPath
     title = $Title; groupTitle = $GroupTitle; rounds = $rd
+    intensityAck = $(if ($state -and $state.intensityAck) { $state.intensityAck } else { $null })
     createdAt = $(if ($state -and $state.createdAt) { $state.createdAt } else { (Get-Date).ToString("s") })
     updatedAt = (Get-Date).ToString("s")
   })
@@ -741,6 +744,23 @@ if ($login -eq 'in' -and $script:ConvKind -eq 'uc') {
 }
 if ($login -eq 'out' -and -not $convId) {
   Write-Warning "当前未登录：本轮走**匿名会话**（/uc/）——关掉标签即失效、不能跨天。要长期/跨天讨论请先在 Edge 登录 ChatGPT。"
+}
+
+# ==================== 3.6 思考强度提醒（极端档位需确认） ====================
+# 仅登录态有强度选择器（匿名会话跳过）。「即时」对难问题效果不好、「Pro」对简单问题浪费，
+# 所以极端档位默认拦下，由用户确认（-ConfirmIntensity）后才继续；
+# 同一 session 同一档位确认过一次就记住（state.intensityAck），不再重复提醒。
+$script:IntensityAcked = $null
+if ($login -eq 'in') {
+  $curThinking = Get-CurrentThinkingName $Session
+  if ($curThinking -eq '即时' -or $curThinking -eq 'Pro') {
+    $ack = if ($state -and $state.PSObject.Properties['intensityAck']) { $state.intensityAck } else { $null }
+    if (-not $ConfirmIntensity -and $ack -ne $curThinking) {
+      $why = if ($curThinking -eq '即时') { '「即时」档不做深思，难问题容易答浅' } else { '「Pro」档成本最高，简单问题用它浪费' }
+      Fail 15 "当前思考强度是「$curThinking」——$why。确认继续：重跑并加 -ConfirmIntensity（本会话记住，同档位不再提醒）；要调整强度：tools\set-intelligence.ps1 -Thinking <即时/中/高/极高/Pro>"
+    }
+    if ($ConfirmIntensity) { $script:IntensityAcked = $curThinking }   # 发问成功后写进 state
+  }
 }
 
 # ============================ 4. 填入 + 发送 ============================
@@ -907,6 +927,7 @@ if ($state -and $state.convUrl) {
 Write-DiscussState $Session (@{
   session = $Session; convUrl = $anchorFinal; convHistory = $hist; docPath = $DocPath
   title = $Title; groupTitle = $GroupTitle; rounds = $round
+  intensityAck = $(if ($script:IntensityAcked) { $script:IntensityAcked } elseif ($state -and $state.intensityAck) { $state.intensityAck } else { $null })
   createdAt = $(if ($state -and $state.createdAt) { $state.createdAt } else { (Get-Date).ToString("s") })
   updatedAt = (Get-Date).ToString("s")
 })

@@ -1,5 +1,7 @@
 # chatgpt-discuss 共享库：ChatGPT 后端接口层（会话正文、账号会话列表）。
 # 依赖：lib/wb.ps1（Eval-JS）。
+# 防重复加载的依赖声明（让本文件可被单独 dot-source / lint）：
+if (-not (Get-Command Eval-JS -ErrorAction SilentlyContinue)) { . "$PSScriptRoot\wb.ps1" }
 # 说明：未登录时这些接口靠 cookie 认证即可（实测 2026-09-20，匿名会话也能读），
 # accessToken 不是必需——所以这里"有 token 才发 Authorization"，不发空的 Bearer。
 

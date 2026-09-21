@@ -1,5 +1,7 @@
 # chatgpt-discuss 共享库：Kimi WebBridge daemon 的 HTTP 封装。
 # 依赖：lib/common.ps1（Read-Text）。
+# 防重复加载的依赖声明（让本文件可被单独 dot-source / lint）：
+if (-not (Get-Command Read-Text -ErrorAction SilentlyContinue)) { . "$PSScriptRoot\common.ps1" }
 #
 # 约定：调用方需先设好**脚本作用域变量 $Daemon**（daemon 基址，如 http://127.0.0.1:10086）。
 # Invoke-WB 读取的是调用方脚本作用域的 $Daemon（dot-source 共享作用域），
