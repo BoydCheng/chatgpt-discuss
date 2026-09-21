@@ -58,6 +58,44 @@ function Get-OwnerFunctionName {
   return '<script>'
 }
 
+# ---------- 收集 dot-source 引入的函数（E3 误报的根因） ----------
+# 库是被 dot-source（. "path"）引入的：本文件 AST 里没有它们的函数定义，
+# Get-Command 在 lint 的独立进程里也找不到 → 必须把被引用文件的函数并入"已定义"集合。
+# 只处理两种路径写法：字面量字符串、含 $PSScriptRoot 的可扩展字符串（本 skill 的库引用约定）。
+function Get-DotSourcedFunctions {
+  param([string]$ScriptPath, [int]$Depth = 0)
+  $names = @{}
+  if ($Depth -gt 6 -or -not (Test-Path $ScriptPath)) { return $names }
+  $tok = $null; $perr = $null
+  $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tok, [ref]$perr)
+  if (-not $ast) { return $names }
+  $dir = Split-Path $ScriptPath -Parent
+  foreach ($cmdAst in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot }, $true)) {
+    $elems = $cmdAst.CommandElements
+    # dot-source 的路径在 CommandElements[0]（"." 是 InvocationOperator，不是元素）
+    if ($elems.Count -lt 1) { continue }
+    $pathExpr = $elems[0]
+    $pathText = $null
+    if ($pathExpr -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+      $pathText = $pathExpr.Value
+    } elseif ($pathExpr -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+      $pathText = $pathExpr.Value -replace '\$PSScriptRoot', $dir
+    }
+    if (-not $pathText) { continue }
+    if (-not [System.IO.Path]::IsPathRooted($pathText)) { $pathText = Join-Path $dir $pathText }
+    if (-not (Test-Path $pathText)) { continue }
+    $tt = $null; $tp = $null
+    $tast = [System.Management.Automation.Language.Parser]::ParseFile($pathText, [ref]$tt, [ref]$tp)
+    if ($tast) {
+      foreach ($fAst in $tast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        $names[$fAst.Name.ToLower()] = $true
+      }
+    }
+    foreach ($k in (Get-DotSourcedFunctions -ScriptPath $pathText -Depth ($Depth + 1)).Keys) { $names[$k] = $true }
+  }
+  return $names
+}
+
 # ---------- 收集参数声明（区分脚本级 / 函数级） ----------
 $scriptParam = @{}    # lower(name) -> @{type;name;line}
 $funcParam = @{}      # "fn|lower(name)" -> @{type;name;line;fn}
@@ -115,6 +153,8 @@ $definedFns = @{}
 foreach ($fnAst in $tree.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
   $definedFns[$fnAst.Name.ToLower()] = $true
 }
+# 并入 dot-source 库引入的函数（它们不在本文件 AST 里，但在运行时可见）
+foreach ($k in (Get-DotSourcedFunctions -ScriptPath $Path).Keys) { $definedFns[$k] = $true }
 $resolvedCache = @{}
 foreach ($cmdAst in $tree.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
   $cmdName = $cmdAst.GetCommandName()

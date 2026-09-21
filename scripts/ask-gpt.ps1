@@ -94,11 +94,16 @@ $CHAT_HOME  = "https://chatgpt.com/"
 $SKILL_DIR  = Split-Path $PSScriptRoot -Parent
 $STATE_DIR  = if ($env:CHATGPT_DISCUSS_STATE) { $env:CHATGPT_DISCUSS_STATE } else { Join-Path $env:LOCALAPPDATA "chatgpt-discuss\state" }
 
-# ============================ 基础设施 ============================
+# ============================ 共享库（dot-source） ============================
+# 通用层已抽到 scripts\lib\；dot-source 后与本脚本共享 $script: 作用域（2026-09-20 实测确认）。
+# 顺序敏感：wb.ps1 依赖 common.ps1 的 Read-Text。
+. "$PSScriptRoot\lib\common.ps1"
+. "$PSScriptRoot\lib\wb.ps1"
+. "$PSScriptRoot\lib\chatgpt-anchor.ps1"
+. "$PSScriptRoot\lib\chatgpt-page.ps1"
+. "$PSScriptRoot\lib\chatgpt-api.ps1"
 
-function Ensure-Dir { param([string]$Path) if ($Path -and -not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
-function Write-Utf8 { param([string]$Path, [string]$Text) Ensure-Dir (Split-Path $Path -Parent); [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false))) }
-function Read-Text { param([string]$Path) if (Test-Path $Path) { return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) } return $null }
+# ============================ 基础设施 ============================
 
 $script:LockSession = $null
 function Release-Lock {
@@ -115,40 +120,8 @@ function Fail {
   exit $Code
 }
 
-# 会话路径种类：c = 登录会话（有持久身份，可用 URL 找回）；
-# uc = 匿名（未登录）会话——**关掉即失效**：URL 只在对话未关时有效，
-# 拿它重开只会得到一条新对话，所以匿名会话绝不能走"用 URL 重开"的恢复路径。
-$script:ConvKind = 'c'
-function Get-ConvKind {
-  param([string]$Url)
-  if ($Url -and $Url -match 'chatgpt\.com/uc/') { return 'uc' }
-  return 'c'
-}
-function Set-ConvKindFromUrl {
-  param([string]$Url)
-  if ($Url) { $script:ConvKind = Get-ConvKind $Url }
-}
-function New-ConvUrl {
-  param([string]$Id)
-  return "https://chatgpt.com/$($script:ConvKind)/$Id"
-}
-function Get-ConvId {
-  param([string]$Url)
-  if (-not $Url) { return $null }
-  $m = [regex]::Match($Url, 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
-  if ($m.Success) { return $m.Groups[1].Value }
-  $m = [regex]::Match($Url, 'chat\.openai\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
-  if ($m.Success) { return $m.Groups[1].Value }
-  return $null
-}
-function Get-CanonicalConvUrl {
-  param([string]$Url)
-  $id = Get-ConvId $Url
-  if (-not $id) { return $null }
-  # 规范化锚点的同时同步会话种类（本脚本是单线程流程，锚点种类即全局事实）
-  $script:ConvKind = Get-ConvKind $Url
-  return "https://chatgpt.com/$($script:ConvKind)/$id"
-}
+# （会话锚点函数 Get-ConvKind / Set-ConvKindFromUrl / New-ConvUrl / Get-ConvId / Get-CanonicalConvUrl
+#   及 $script:ConvKind 已抽取到 scripts\lib\chatgpt-anchor.ps1，由顶部 dot-source 引入）
 
 # ============================ 状态（SSOT） ============================
 
@@ -254,200 +227,13 @@ function Update-DocMarker {
 
 # ============================ webbridge ============================
 
-function Resolve-DaemonAddr {
-  # 原版硬编码 10086：用户一旦把 daemon 挪到别的端口，整条链路全废。
-  # webbridge 官方约定：真实地址以 daemon.addr / `status` 输出为准，配置文件只用来搬端口。
-  $p = Join-Path $env:USERPROFILE ".kimi-webbridge\daemon.addr"
-  $raw = Read-Text $p
-  if ($raw) {
-    $a = $raw.Trim()
-    if ($a -match '^[A-Za-z0-9\.\-]+:\d+$') { return "http://$a" }
-  }
-  return "http://127.0.0.1:10086"
-}
-function Get-DaemonStatus {
-  # 带重试：瞬时抖动不该判死（历史上一次抖动就把整轮打进"手工 curl"的无状态邪路）
-  param([string]$Base, [int]$Attempts = 6)
-  for ($i = 1; $i -le $Attempts; $i++) {
-    $raw = $null
-    try { $raw = (& curl.exe -s --noproxy "*" --max-time 6 "$Base/status" 2>$null) } catch {}
-    if ($raw) { try { $o = $raw | ConvertFrom-Json; if ($o -and $o.running) { return $o } } catch {} }
-    if ($i -lt $Attempts) { Start-Sleep -Milliseconds (300 * $i) }
-  }
-  return $null
-}
-function Get-DaemonDiag {
-  param([string]$Base)
-  $u = [Uri]$Base
-  $tcp = "closed"
-  try { $c = New-Object System.Net.Sockets.TcpClient; $c.Connect($u.Host, $u.Port); $tcp = "open"; $c.Close() } catch { $tcp = "closed" }
-  $raw = ""
-  try { $raw = ((& curl.exe -s -S --noproxy "*" --max-time 6 "$Base/status" 2>&1) | Select-Object -First 2) -join " | " } catch {}
-  return ("webbridge daemon 不可用（$Base）。TCP $($u.Host):$($u.Port)=$tcp。curl 说: $raw  " +
-          "先跑: `"$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe`" start")
-}
+# （webbridge 封装 Resolve-DaemonAddr / Get-DaemonStatus / Get-DaemonDiag / Invoke-WB / Eval-JS
+#   已抽取到 scripts\lib\wb.ps1，由顶部 dot-source 引入）
 
-function Invoke-WB {
-  param([string]$Action, [hashtable]$WBArgs, [string]$SessionName)
-  $body = @{ action = $Action; args = $WBArgs; session = $SessionName } | ConvertTo-Json -Depth 12 -Compress
-  $tmp = Join-Path $env:TEMP ("wb-req-" + [guid]::NewGuid().ToString("N") + ".json")
-  [System.IO.File]::WriteAllText($tmp, $body, (New-Object System.Text.UTF8Encoding($false)))
-  try {
-    $raw = & curl.exe -s --noproxy "*" --max-time 120 -X POST "$Daemon/command" -H "Content-Type: application/json" --data-binary "@$tmp" 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
-    if (-not $raw) { throw "empty response for action $Action" }
-    $resp = $raw | ConvertFrom-Json
-    if (-not $resp.ok) { throw "webbridge error: $($resp.error.message)" }
-    return $resp.data
-  } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-}
-function Eval-JS {
-  param([string]$Code, [string]$SessionName)
-  $d = Invoke-WB "evaluate" @{ code = $Code } $SessionName
-  return $d.value
-}
-function Get-LoginState {
-  # 探测当前 ChatGPT 页面的登录态：/api/auth/session 带 user.id 即已登录。
-  # 它只用于"开场判断与告知"，**不**决定恢复策略——恢复策略以锚点的会话种类
-  # （/c/ 登录会话 vs /uc/ 匿名会话）为准，那是事实，而登录态可能中途变化。
-  param([string]$S)
-  $js = @'
-(async()=>{
-  try{
-    const r = await fetch('/api/auth/session', {credentials:'include'});
-    if(!r.ok) return 'unknown';
-    const j = await r.json();
-    return (j && j.user && j.user.id) ? 'in' : 'out';
-  }catch(e){ return 'unknown' }
-})()
-'@
-  try { $v = Eval-JS $js $S; if ($v) { return [string]$v } } catch {}
-  return 'unknown'
-}
-function Get-SessionChatGptTabs {
-  param([string]$S)
-  try {
-    $r = Invoke-WB "list_tabs" @{} $S
-    if ($r -and $r.tabs) { return @($r.tabs | Where-Object { $_.url -like "*chatgpt.com/*" -or $_.url -like "*chat.openai.com/*" }) }
-  } catch {}
-  return @()
-}
-function Activate-EdgeWindow {
-  # 浏览器进程名未必是 msedge（Chrome / 其它 Chromium 分支）——逐个试，别硬编码一个
-  foreach ($name in @('msedge', 'chrome', 'brave', 'vivaldi')) {
-    try {
-      $ws = New-Object -ComObject WScript.Shell
-      if ($ws.AppActivate($name)) { Start-Sleep -Milliseconds 500; return $true }
-    } catch {}
-  }
-  return $false
-}
-function Get-ConversationState {
-  # 从 ChatGPT 后端接口读权威消息体（而不是抓 DOM）
-  # 实测(2026-09-14)：DOM innerText 只拿到第一段（27/163、52/582），丢 80~95% 正文；
-  # 接口有干净的完成信号：end_turn=true && content_type='text' && status='finished_successfully'
-  param([string]$S, [string]$ConvId)
-  $js = @"
-(async()=>{
-  try{
-    if(!window.__ccTok){ try{ const s=await (await fetch('/api/auth/session')).json(); window.__ccTok=s&&s.accessToken; }catch(e){} }
-    const h={Authorization:'Bearer '+(window.__ccTok||'')};
-    const r=await fetch('/backend-api/conversation/$ConvId',{headers:h,credentials:'include'});
-    if(!r.ok) return JSON.stringify({error:'HTTP '+r.status});
-    const j=await r.json();
-    const all=Object.values(j.mapping||{}).map(n=>n&&n.message).filter(m=>m&&m.author&&m.author.role==='assistant');
-    const fin=all.filter(m=>m.end_turn===true && m.content && m.content.content_type==='text' && m.status==='finished_successfully');
-    const last=fin[fin.length-1];
-    const txt=last?(last.content.parts||[]).join(''):'';
-    return JSON.stringify({n:fin.length,len:txt.length,text:txt});
-  }catch(e){ return JSON.stringify({error:String(e)}) }
-})()
-"@
-  try {
-    $v = Eval-JS $js $S
-    if (-not $v) { return $null }
-    return ($v | ConvertFrom-Json)
-  } catch { return $null }
-}
 
-function Get-LastAnswerText {
-  param([string]$S)
-  try { return Eval-JS '(()=>{const els=document.querySelectorAll("[data-message-author-role=\"assistant\"]");const el=els[els.length-1];return el?el.innerText:""})()' $S }
-  catch { return $null }
-}
-function Resolve-ComposerTarget {
-  # 定位对话框并打标记 data-cc-composer，返回命中描述（空串 = 没找到）。
-  # 不押单一选择器：composer 在登录/未登录、新旧版之间结构不同
-  # （textarea#prompt-textarea ↔ ProseMirror contenteditable），写死一个必然脆。
-  # 候选按"最具体 → 最通用"排序；全落空时退到"页面上最后一个可见可编辑元素"。
-  param([string]$S)
-  $js = @'
-(()=>{
-  const vis = e => { try { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 } catch(_) { return false } };
-  document.querySelectorAll('[data-cc-composer]').forEach(e => e.removeAttribute('data-cc-composer'));
-  const ok = e => e && vis(e) && !e.disabled && !e.readOnly;
-  const cands = [
-    '#prompt-textarea',
-    'div[contenteditable="true"]#prompt-textarea',
-    'form .ProseMirror[contenteditable="true"]',
-    'form [contenteditable="true"]',
-    'main [contenteditable="true"]',
-    'form textarea',
-    'textarea'
-  ];
-  let el = null;
-  for (const c of cands) {
-    try { const e = document.querySelector(c); if (ok(e)) { el = e; break } } catch(_) {}
-  }
-  if (!el) {
-    const all = [...document.querySelectorAll('[contenteditable="true"],textarea')].filter(ok);
-    el = all.length ? all[all.length - 1] : null;
-  }
-  if (!el) return '';
-  el.setAttribute('data-cc-composer', '1');
-  return el.tagName.toLowerCase() + (el.getAttribute('contenteditable') === 'true' ? '/ce' : '/val');
-})()
-'@
-  try { $v = Eval-JS $js $S; if ($v) { return [string]$v } } catch {}
-  return ''
-}
-function Resolve-SendTarget {
-  # 定位发送按钮并打标记 data-cc-send，返回命中描述（空串 = 没找到）。
-  # **必须在填完内容之后调用**：输入框为空时 ChatGPT 把发送键换成语音按钮，
-  # 那一刻"最后一个按钮"并不是发送键。
-  param([string]$S)
-  $js = @'
-(()=>{
-  const vis = e => { try { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 } catch(_) { return false } };
-  document.querySelectorAll('[data-cc-send]').forEach(e => e.removeAttribute('data-cc-send'));
-  const cands = [
-    'button[data-testid="send-button"]',
-    'button[aria-label*="Send"]',
-    'button[aria-label*="发送"]',
-    'form button[type="submit"]'
-  ];
-  let el = null;
-  for (const c of cands) {
-    try { const e = document.querySelector(c); if (e && vis(e) && !e.disabled) { el = e; break } } catch(_) {}
-  }
-  if (!el) {
-    const comp = document.querySelector('[data-cc-composer]') || document.querySelector('#prompt-textarea');
-    const scope = comp ? (comp.closest('form') || comp.parentElement) : null;
-    if (scope) {
-      const skip = /voice|dictat|microphone|attach|upload|tool|语音|话筒|附件|上传|工具/i;
-      const btns = [...scope.querySelectorAll('button')].filter(b =>
-        vis(b) && !b.disabled && !skip.test(b.getAttribute('aria-label') || ''));
-      el = btns.length ? btns[btns.length - 1] : null;
-    }
-  }
-  if (!el) return '';
-  el.setAttribute('data-cc-send', '1');
-  return (el.getAttribute('aria-label') || el.getAttribute('data-testid') || el.tagName.toLowerCase());
-})()
-'@
-  try { $v = Eval-JS $js $S; if ($v) { return [string]$v } } catch {}
-  return ''
-}
+# （页面 DOM 层 Get-LoginState / Get-SessionChatGptTabs / Activate-EdgeWindow / Get-LastAnswerText /
+#   Resolve-ComposerTarget / Resolve-SendTarget 已抽到 scripts\lib\chatgpt-page.ps1；
+#   接口层 Get-ConversationState 已抽到 scripts\lib\chatgpt-api.ps1）
 function Wait-Composer {
   param([string]$S, [int]$Seconds = 45)
   $deadline = (Get-Date).AddSeconds($Seconds)
@@ -519,33 +305,7 @@ function Close-StrayTabs {
 
 # ============================ 服务器端会话列表（-ListChats / -Attach 共用） ============================
 
-function Get-ChatListJs {
-  # 在 ChatGPT 页面里用它的后端接口取会话列表（走页面自身的登录态 + accessToken）
-  param([int]$Limit = 30)
-  @"
-(async()=>{
-  try{
-    let tk=null;
-    try{ const s=await (await fetch('/api/auth/session',{credentials:'include'})).json(); tk=s&&s.accessToken; }catch(e){}
-    const h = tk ? {Authorization:'Bearer '+tk} : {};
-    let out=[], off=0, total=null;
-    while(out.length < $Limit){
-      const r = await fetch('/backend-api/conversations?offset='+off+'&limit=28&order=updated',{headers:h,credentials:'include'});
-      if(!r.ok) return JSON.stringify({error:'HTTP '+r.status});
-      const j = await r.json();
-      if(total===null) total=(typeof j.total==='number')?j.total:null;
-      const items=j.items||[];
-      if(!items.length) break;
-      for(const i of items) out.push({id:i.id, title:i.title, upd:i.update_time});
-      off += items.length;
-      if(out.length >= $Limit) break;
-      if(total!==null && off>=total) break;
-    }
-    return JSON.stringify({total:total, count:out.length, items:out.slice(0,$Limit)});
-  }catch(e){ return JSON.stringify({error:String(e)}); }
-})()
-"@
-}
+# （Get-ChatListJs 已抽到 scripts\lib\chatgpt-api.ps1）
 
 $script:ScanSession = "cc-browse"
 function Get-ScanTab {

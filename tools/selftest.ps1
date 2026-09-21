@@ -62,6 +62,25 @@ Write-Host "=== A. 静默检查（真实脚本） ===" -ForegroundColor Cyan
 Add-Result "A1 lint 真实脚本 0 ERROR" ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
 
 Write-Host ""
+Write-Host "=== A2. 锚点纯函数（库单测，表驱动） ===" -ForegroundColor Cyan
+$anchorLib = Join-Path $SkillDir "scripts\lib\chatgpt-anchor.ps1"
+. $anchorLib
+$anchorCases = @(
+  @{ url='https://chatgpt.com/c/6aa00000-0000-0000-0000-000000000000';  id='6aa00000-0000-0000-0000-000000000000'; kind='c';  canon='https://chatgpt.com/c/6aa00000-0000-0000-0000-000000000000' }
+  @{ url='https://chatgpt.com/uc/6aafb7c5-c2a8-83ea-ae37-3b148929c03c'; id='6aafb7c5-c2a8-83ea-ae37-3b148929c03c'; kind='uc'; canon='https://chatgpt.com/uc/6aafb7c5-c2a8-83ea-ae37-3b148929c03c' }
+  @{ url='https://chat.openai.com/c/abc12345-x';  id='abc12345-x'; kind='c';  canon='https://chatgpt.com/c/abc12345-x' }
+  @{ url='https://chatgpt.com/';                  id=$null;         kind='c';  canon=$null }
+  @{ url='not-a-url';                             id=$null;         kind='c';  canon=$null }
+)
+$a2bad = @()
+foreach ($c in $anchorCases) {
+  if ((Get-ConvId $c.url) -ne $c.id) { $a2bad += "Get-ConvId($($c.url))" }
+  if ((Get-CanonicalConvUrl $c.url) -ne $c.canon) { $a2bad += "Get-CanonicalConvUrl($($c.url))" }
+  if ((Get-ConvKind $c.url) -ne $c.kind) { $a2bad += "Get-ConvKind($($c.url))" }
+}
+Add-Result "A2 锚点纯函数（c/uc/openai/非法）" ($a2bad.Count -eq 0) $(if ($a2bad.Count) { "失败: " + ($a2bad -join '; ') } else { "5 组用例全过" })
+
+Write-Host ""
 Write-Host "=== B. 检查器自证（故意注入坑的样本）===" -ForegroundColor Cyan
 $badOut = (& $pwshExe -NoProfile -File $lintPath -Path $badSample) -join "`n"
 $badCount = ([regex]::Matches($badOut, '(?m)^\s+(E\d|W\d) ')).Count

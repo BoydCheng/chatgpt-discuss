@@ -36,29 +36,17 @@ $skillDir = Split-Path $PSScriptRoot -Parent
 $askGpt = Join-Path $skillDir "scripts\ask-gpt.ps1"
 
 # ---------- webbridge 封装 ----------
-function Resolve-DaemonBase {
-  $p = Join-Path $env:USERPROFILE ".kimi-webbridge\daemon.addr"
-  if (Test-Path $p) {
-    $a = ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)).Trim()
-    if ($a -match '^[A-Za-z0-9\.\-]+:\d+$') { return "http://$a" }
-  }
-  return "http://127.0.0.1:10086"
-}
-$Daemon = Resolve-DaemonBase
-function Invoke-WB {
-  param([string]$Action, [hashtable]$WBArgs, [string]$SessionName)
-  $body = @{ action = $Action; args = $WBArgs; session = $SessionName } | ConvertTo-Json -Depth 12 -Compress
-  $tmp = Join-Path $env:TEMP ("wb-" + [guid]::NewGuid().ToString("N") + ".json")
-  [System.IO.File]::WriteAllText($tmp, $body, (New-Object System.Text.UTF8Encoding($false)))
-  try { return ((& curl.exe -s --noproxy "*" --max-time 120 -X POST "$Daemon/command" -H "Content-Type: application/json" --data-binary "@$tmp" 2>$null) | ConvertFrom-Json) }
-  finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-}
-function Eval-JS { param([string]$Code, [string]$S) return (Invoke-WB "evaluate" @{ code = $Code } $S).data.value }
+# 共享库（dot-source）：webbridge 封装与通用文件 IO 已抽到 scripts\lib\，单一事实源。
+# dot-source 后与本脚本共享 $script: 作用域。注意：库里的 Invoke-WB 返回 data（不是整体响应），
+# 且 daemon 返回 ok=false 时会 throw——本脚本原先不查 ok 是一处隐患，此处顺带修正。
+. "$PSScriptRoot\..\scripts\lib\common.ps1"
+. "$PSScriptRoot\..\scripts\lib\wb.ps1"
+$Daemon = Resolve-DaemonAddr
 
 function Ensure-ChatTab {
-  $r = Invoke-WB "list_tabs" @{} $Session
   $tabs = @()
-  if ($r.ok) { $tabs = @($r.data.tabs | Where-Object { $_.url -like "*chatgpt.com/*" }) }
+  # 库版 Invoke-WB 返回 data（不是整体响应），失败时 throw
+  try { $r = Invoke-WB "list_tabs" @{} $Session; if ($r -and $r.tabs) { $tabs = @($r.tabs | Where-Object { $_.url -like "*chatgpt.com/*" }) } } catch {}
   if ($tabs.Count -gt 0) {
     try { Invoke-WB "find_tab" @{ url = $tabs[0].url } $Session | Out-Null; return $true } catch {}
   }
@@ -81,7 +69,7 @@ function Get-ConvTurns {
 (async()=>{
   try{
     if(!window.__ccTok){ try{ const s=await (await fetch('/api/auth/session')).json(); window.__ccTok=s&&s.accessToken; }catch(e){} }
-    const h={Authorization:'Bearer '+(window.__ccTok||'')};
+    const h=window.__ccTok?{Authorization:'Bearer '+window.__ccTok}:{};
     const r=await fetch('/backend-api/conversation/$ConvId',{headers:h,credentials:'include'});
     if(!r.ok) return JSON.stringify({error:'HTTP '+r.status});
     const j=await r.json();
