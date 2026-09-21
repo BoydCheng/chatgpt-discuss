@@ -189,6 +189,20 @@ pwsh -File tools\set-intelligence.ps1 -Model 5.6      # 换模型（部分匹配
 
 ---
 
+## 脚本与工具（入口清单）
+
+| 入口 | 作用 | 碰浏览器 | 耗对话额度 |
+|---|---|---|---|
+| `scripts/ask-gpt.ps1` | 提问 / 续聊 / 管理讨论（**主入口**） | 是 | 发问才耗 |
+| `tools/set-intelligence.ps1` | 调整模型与思考强度（仅登录态） | 是 | 否（只改设置） |
+| `tools/verify-docs.ps1` | 文档体检：比对文档与接口正文、找残缺 | 是 | 否（只读） |
+| `tools/selftest.ps1` | 改脚本后的自检（lint + 离线行为回归） | 否 | 否 |
+| `tools/lint.ps1` | AST 级静态检查（识别 dot-source 引入的函数） | 否 | 否 |
+
+共享库 `scripts/lib/`（被上面 dot-source，不单独运行）：`common.ps1`（文件 IO）、`wb.ps1`（webbridge 封装）、`chatgpt-anchor.ps1`（锚点纯函数）、`chatgpt-page.ps1`（页面 DOM 层）、`chatgpt-api.ps1`（后端接口层）。
+
+---
+
 ## 前置条件
 
 - Kimi WebBridge daemon 运行中（`kimi-webbridge start` 启动）。地址**自动探测**：
