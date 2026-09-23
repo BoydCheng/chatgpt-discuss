@@ -774,7 +774,7 @@ if ($login -eq 'in') {
 #   根因不是"读失败"，而是"读失败被当成了基线为 0"。
 # 所以：**续聊模式下基线是发送的前置条件**——拿不到就不发问，让调用方稍后重试，
 # 而不是发出去之后猜。新建模式（-New）的会话此刻还不存在，基线天然为 0，无需读。
-$baseN = 0; $baseText = ''; $baseKnown = $true; $expectedS = 0
+$baseN = 0; $baseText = ''; $baseKnown = $true; $expectedS = 0; $baseToolCount = 0
 if ($convId) {
   # 只试 2 次、间隔 10s —— **刻意不做递进重试**（2026-09-23 修正）：
   # 基线读失败几乎总是后端 429（限流），此时连环重试等于在限流期间加压，
@@ -793,6 +793,8 @@ if ($convId) {
   }
   $baseN = [int]$bl.n
   $baseText = [string]$bl.text
+  # 工具/搜索消息条数基线：本轮若变多，说明这次触发了联网搜索 —— 答案在那段时间不会增长。
+  if ($bl.PSObject.Properties['tool_count'] -and $bl.tool_count) { $baseToolCount = [int]$bl.tool_count }
   # 历史生成耗时（同一会话内各轮 assistant.create_time − user.create_time）。
   # 用途只有一个：判断"这轮已经等得比历史最久还长了"（异常），**不用于预测**本轮耗时
   # —— 实测方差极大（4.5s / 7.3s / 50.5s / 274s），按均值推迟早期轮询反而会拖慢快答案。
@@ -862,24 +864,35 @@ if (-not $convId) {
 # 只有跳转 URL 还依赖 DOM（读 location.href 是可靠的）。
 
 $answer = $null
+$answerFromDom = $false; $answerFromPartial = $false   # 两条"不完整"通道的标注开关
 # 基线（$baseN / $baseText / $baseKnown）已在第 4 节**发送前**建立，此处不再重读——
 # 发送后再读会引入竞态：这一读可能已经包含新答案，也可能因限流返回陈旧值，
 # 两种都会让"新答案判定"失去依据（旧实现正是这么错的，见第 4 节注释）。
 $recoverCount = 0; $lastRecover = (Get-Date).AddMinutes(-10)
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $iter = 0; $apiErr = 0; $stallWarned = $false; $pastMaxWarned = $false
-# 429 感知退避（2026-09-23 加）：本循环在生成期间每 1.2~2.5s 读一次接口，6 分钟
-# 可达约 200 次请求；一旦后端开始限流（HTTP 429），按原速重试等于持续加压 ——
-# 现象就是**会话页本身加载不出来**（新开一个聊天页反而正常）。被限流时改为指数退避，
-# 成功一次即复位。只改节奏、不改判定。
+# 429 感知退避（2026-09-23 加）：生成期间反复读同一会话接口，是限流的直接来源；
+# 被限流后按原速重试等于持续加压，现象是**会话页本身加载不出来**（提示 too many requests）。
+# 现在：429 → 指数退避（上限 120s），成功一次即复位；退避期间不再打接口。
 $apiBackoffMs = 0
+# 搜索/停滞感知（2026-09-23 加，用户要求"他要进搜索了就别一直轮询"）：
+# 联网搜索阶段答案根本不会增长，此时轮询纯属白打。用两个信号放宽节奏 ——
+#   ① 会话里出现新的 tool 角色消息（本轮触发了搜索/工具）；
+#   ② 进行中正文连续多轮没有增量。
+$lastPartialLen = -1; $stallCount = 0; $searchSeen = $false
+# 硬请求预算：无论超时多长，单轮最多读这么多次接口。这是防"把账号打成限流"的兜底，
+# 不指望靠调 -TimeoutSec 去等长回合（那样只会把请求数一起放大）。
+$maxPolls = 40
 $tStart = Get-Date
 
 while ((Get-Date) -lt $deadline) {
   $iter++
-  # 轮询节奏由 Get-PollDelayMs 统一决定（几何退避 + 429 优先），见该函数注释里的
-  # 请求量测算：默认 360s 下由约 165 次降到约 25 次。
-  $ms = Get-PollDelayMs -Iter $iter -BackoffMs $apiBackoffMs
+  if ($iter -gt $maxPolls) {
+    Write-Warning "已达单轮请求上限（$maxPolls 次）——停止轮询，转入部分获取。这是为了不把账号打成限流"
+    break
+  }
+  # 轮询节奏由 Get-PollDelayMs 统一决定（几何退避 + 搜索/停滞放宽 + 429 优先）。
+  $ms = Get-PollDelayMs -Iter $iter -BackoffMs $apiBackoffMs -Searching $searchSeen -StallCount $stallCount
   Start-Sleep -Milliseconds $ms
 
   # 新建轮：先用 location.href 把会话 id 钉下来（URL 读取可靠，不受渲染影响）
@@ -916,6 +929,20 @@ while ((Get-Date) -lt $deadline) {
   }
 
   $apiBackoffMs = 0   # 读到一次就复位退避，恢复正常轮询节奏
+  # ── 搜索 / 停滞感知（2026-09-23）─────────────────────────────────────────
+  # 目标：**联网搜索期间不要一直轮询**。答案在搜索阶段不增长，此时读接口纯属白打，
+  # 还会把账号推向限流。两个信号任一成立就把节奏放宽（见 Get-PollDelayMs）。
+  if (-not $searchSeen -and $st.PSObject.Properties['tool_count'] -and
+      [int]$st.tool_count -gt $baseToolCount) {
+    $searchSeen = $true
+    Write-Warning "本轮出现工具/搜索活动（tool 消息 $baseToolCount → $($st.tool_count)）——" +
+                  "搜索期间答案不会增长，已把轮询放慢到 ≥30s，不再密集读接口"
+  }
+  if ($st.PSObject.Properties['partial_len']) {
+    $plen = [int]$st.partial_len
+    if ($plen -gt 0 -and $plen -eq $lastPartialLen) { $stallCount++ } else { $stallCount = 0 }
+    $lastPartialLen = $plen
+  }
   $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
                             -N ([int]$st.n) -Text ([string]$st.text)
   if ($verdict -eq 'new') { $answer = [string]$st.text; break }
@@ -924,9 +951,8 @@ while ((Get-Date) -lt $deadline) {
     Write-Warning ("读到的最后一条完成回答（n=$($st.n)）与本轮之前的基线正文逐字相同——" +
                    "判为旧回答、继续等；这通常是后端限流把陈旧响应返回了，不要当成新答案")
   }
-  if (-not $stallWarned -and $iter -ge 60) {
-    $stallWarned = $true
-    Write-Warning "60s 仍未出现新的完成消息（生成很慢？）——继续等，不刷新"
+  if ($stallCount -ge 3 -and -not $searchSeen) {
+    Write-Warning "进行中正文已连续 $stallCount 轮无增量（当前 $lastPartialLen 字符）——放慢轮询"
   }
   # 已超过历史最久的一轮还没出结果 → 说清楚这属于异常（限流 / 卡住），
   # 而不是继续用"生成很慢"含糊描述，避免调用方误以为再等就好。
@@ -949,6 +975,23 @@ if (-not $answer) {
       if ($verdict -eq 'new') { $answer = [string]$st.text }
       elseif ($verdict -eq 'stale-same-text') {
         Write-Warning "最后一次读取拿到的仍是基线正文（陈旧响应），不作为本轮答案"
+      }
+      # ── 部分获取（2026-09-23 加，用户要求"能否先部分获取"）────────────────
+      # 完整回答迟迟不出现时有两条路：一直等到超时（还要继续打接口，正是把账号
+      # 推向限流的做法），或者**把已经生成的部分先取回来**。这里是后者：只在已等够
+      # （≥60s）且进行中正文与基线不同（确有新内容）时才用，并复用"不完整"标注与
+      # 告警通道——档案当证据用，绝不能静默写残缺。
+      if (-not $answer -and $st.PSObject.Properties['partial_len']) {
+        $pv = Test-PartialAnswer -PartialText ([string]$st.partial_text) -BaseText $baseText `
+                                 -ElapsedS $elapsedWait -MinElapsedS 60
+        if ($pv -eq 'partial') {
+          $answer = [string]$st.partial_text
+          $answerFromPartial = $true      # 与 DOM 兜底**不同**的标注：这条是"仍在生成"
+          Write-Warning ("按**部分获取**返回：回答仍在生成中，已取现有 $($st.partial_len) 字符" +
+                         "（搜索活动=$searchSeen，已轮询 $iter 次）——正文不完整，请用 tools\verify-docs.ps1 复核")
+        } else {
+          Write-Warning "进行中正文暂无可取内容（$($st.partial_len) 字符）或与基线相同，不按部分获取"
+        }
       }
     }
   }
@@ -1002,7 +1045,11 @@ if (-not (Test-Path $DocPath)) {
 }
 $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 # 来源标注：只有从断言接口读到正文才不加标记；DOM 兜底必须在文档里留痕，禁止静默写残缺
-$srcNote = if ($answerFromDom) { "`r`n`r`n> ⚠️ **本段来自 DOM 兜底（接口读取失败），可能不完整** —— 用 tools\verify-docs.ps1 复核" } else { "" }
+$srcNote = if ($answerFromPartial) {
+  "`r`n`r`n> ⚠️ **本段为部分获取（回答尚未生成完毕），正文不完整** —— 需要完整版时重跑同一命令；复核用 tools\verify-docs.ps1"
+} elseif ($answerFromDom) {
+  "`r`n`r`n> ⚠️ **本段来自 DOM 兜底（接口读取失败），可能不完整** —— 用 tools\verify-docs.ps1 复核"
+} else { "" }
 $entry = "`r`n## Q$round $ts`r`n**Q:** $Question`r`n`r`n**A:**`r`n$answer$srcNote`r`n"
 [System.IO.File]::AppendAllText($DocPath, $entry, (New-Object System.Text.UTF8Encoding($false)))
 Update-DocMarker -Path $DocPath -S $Session -Curl $anchorFinal -Rounds $round

@@ -6,7 +6,8 @@
   三部分：
     A. 静态检查：对真实脚本跑 lint.ps1（必须 0 ERROR）
        A2 锚点纯函数表驱动；A3 新答案判定表驱动（含 2026-09-23 静默写错档案的回归）；
-       A4 轮询节奏表驱动 + 360s 内总请求量性质断言（治 429 加压 / 页面加载不出来）
+       A4 轮询节奏表驱动 + 请求量性质断言（治 429 加压 / 页面加载不出来）；
+       A5 部分获取判定表驱动（等够且确有新内容才取回）
     B. 检查器自证：对故意注入坑的样本跑 lint.ps1（必须抓到 ≥6 项）
     C. 离线行为：只测不碰浏览器的路径（用不可达 daemon 逼它提前失败），校验退出码
        T1 -Status 空状态            → 0
@@ -108,19 +109,22 @@ Add-Result "A3 新答案判定（含静默写错回归）" ($a3bad.Count -eq 0) 
 
 Write-Host ""
 Write-Host "=== A4. 轮询节奏（纯函数 + 请求量性质断言） ===" -ForegroundColor Cyan
-# 旧实现"前 40 次 1.2s、之后 2.5s"在默认 TimeoutSec=360 下一轮约 165 次请求；
-# 被 429 后仍按原速重试，压力会被放大。这里既钉住单点值，也钉住**总请求量**。
+# 旧实现"前 40 次 1.2s、之后 2.5s"在默认 TimeoutSec=360 下一轮约 165 次请求。
+# 只加"起始 1s 上限 20s"的几何退避**仍不够**（实测被限流到页面提示 too many requests），
+# 故改为起始 2s、上限 60s，并对"搜索中/停滞"进一步放宽。这里既钉单点值，也钉总请求量。
 $delayCases = @(
-  @{ name = '第1次(最快答案要能命中)'; p = @{ Iter = 1 };                          want = 1000 }
-  @{ name = '第2次';                   p = @{ Iter = 2 };                          want = 1000 }
-  @{ name = '第3次翻倍';               p = @{ Iter = 3 };                          want = 2000 }
-  @{ name = '第5次';                   p = @{ Iter = 5 };                          want = 4000 }
-  @{ name = '第9次';                   p = @{ Iter = 9 };                          want = 16000 }
-  @{ name = '第11次到上限';            p = @{ Iter = 11 };                         want = 20000 }
-  @{ name = '很多次仍在上限';          p = @{ Iter = 100 };                        want = 20000 }
-  @{ name = 'Iter=0 视作1';            p = @{ Iter = 0 };                          want = 1000 }
-  @{ name = '429退避优先';             p = @{ Iter = 1; BackoffMs = 3000 };        want = 3000 }
-  @{ name = '429退避也不超上限';       p = @{ Iter = 1; BackoffMs = 99999 };       want = 20000 }
+  @{ name = '第1次(最快答案要能命中)'; p = @{ Iter = 1 };                          want = 2000 }
+  @{ name = '第2次';                   p = @{ Iter = 2 };                          want = 2000 }
+  @{ name = '第3次翻倍';               p = @{ Iter = 3 };                          want = 4000 }
+  @{ name = '第5次';                   p = @{ Iter = 5 };                          want = 8000 }
+  @{ name = '第9次';                   p = @{ Iter = 9 };                          want = 32000 }
+  @{ name = '第11次到上限';            p = @{ Iter = 11 };                         want = 60000 }
+  @{ name = '很多次仍在上限';          p = @{ Iter = 100 };                        want = 60000 }
+  @{ name = 'Iter=0 视作1';            p = @{ Iter = 0 };                          want = 2000 }
+  @{ name = '搜索中至少30s';           p = @{ Iter = 1; Searching = $true };       want = 30000 }
+  @{ name = '停滞≥3次至少45s';         p = @{ Iter = 1; StallCount = 3 };          want = 45000 }
+  @{ name = '429退避优先';             p = @{ Iter = 1; BackoffMs = 5000 };        want = 5000 }
+  @{ name = '429退避上限120s';         p = @{ Iter = 1; BackoffMs = 999999 };      want = 120000 }
 )
 $a4bad = @()
 foreach ($c in $delayCases) {
@@ -136,9 +140,35 @@ while ($total -lt $budget) {
   $polls++
   $total += (Get-PollDelayMs -Iter $polls) / 1000.0
 }
-Add-Result "A4b 360s 内请求数 ≤40（旧约165）" ($polls -le 40) "$polls 次"
+Add-Result "A4b 360s 内请求数 ≤20（旧约165）" ($polls -le 20) "$polls 次"
 $firstHit = (Get-PollDelayMs -Iter 1) / 1000.0
-Add-Result "A4c 首次轮询仍 ≤1.5s（不拖慢快答案）" ($firstHit -le 1.5) "$firstHit s"
+Add-Result "A4c 首次轮询 ≤2.5s（不拖慢快答案）" ($firstHit -le 2.5) "$firstHit s"
+# 搜索场景下的请求量：这是"搜索时别一直轮询"的直接量化
+$total = 0; $polls = 0; $budget = 600
+while ($total -lt $budget) {
+  $polls++
+  $total += (Get-PollDelayMs -Iter $polls -Searching $true) / 1000.0
+}
+Add-Result "A4d 搜索中 600s 内请求数 ≤20" ($polls -le 20) "$polls 次"
+
+Write-Host ""
+Write-Host "=== A5. 部分获取判定（纯函数，表驱动） ===" -ForegroundColor Cyan
+# "先部分获取"：等够时间且进行中正文确有新内容才取回；否则必须判 not-ready，
+# 不能把半截/旧内容当结果写进档案。
+$partialCases = @(
+  @{ name = '等够+有新内容';   p = @{ PartialText = 'abc'; BaseText = 'old'; ElapsedS = 90 };  want = 'partial' }
+  @{ name = '没等够(60s)';     p = @{ PartialText = 'abc'; BaseText = 'old'; ElapsedS = 30 };  want = 'not-ready' }
+  @{ name = '无进行中正文';    p = @{ PartialText = '';    BaseText = 'old'; ElapsedS = 90 };  want = 'not-ready' }
+  @{ name = '正文等于基线';    p = @{ PartialText = 'old'; BaseText = 'old'; ElapsedS = 90 };  want = 'not-ready' }
+  @{ name = '首轮无基线+有新'; p = @{ PartialText = 'abc'; BaseText = '';    ElapsedS = 90 };  want = 'partial' }
+)
+$a5bad = @()
+foreach ($c in $partialCases) {
+  $pp = $c.p
+  $got = Test-PartialAnswer @pp
+  if ($got -ne $c.want) { $a5bad += "$($c.name): 期望 $($c.want) 实得 $got" }
+}
+Add-Result "A5 部分获取判定" ($a5bad.Count -eq 0) $(if ($a5bad.Count) { "失败: " + ($a5bad -join '; ') } else { "$($partialCases.Count) 组用例全过" })
 
 Write-Host ""
 Write-Host "=== B. 检查器自证（故意注入坑的样本）===" -ForegroundColor Cyan

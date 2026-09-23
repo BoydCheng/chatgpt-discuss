@@ -18,20 +18,31 @@ function Get-ConversationState {
     const r=await fetch('/backend-api/conversation/$ConvId',{headers:h,credentials:'include'});
     if(!r.ok) return JSON.stringify({error:'HTTP '+r.status});
     const j=await r.json();
-    const all=Object.values(j.mapping||{}).map(n=>n&&n.message).filter(m=>m&&m.author&&m.author.role==='assistant');
-    const fin=all.filter(m=>m.end_turn===true && m.content && m.content.content_type==='text' && m.status==='finished_successfully');
+    const all=Object.values(j.mapping||{}).map(n=>n&&n.message).filter(m=>m&&m.author&&m.content);
+    const byTime=all.slice().sort((a,b)=>(a.create_time||0)-(b.create_time||0));
+    const isText=m=>m.content.content_type==='text';
+    const fin=byTime.filter(m=>m.author.role==='assistant' && m.end_turn===true && isText(m) && m.status==='finished_successfully');
     const last=fin[fin.length-1];
     const txt=last?(last.content.parts||[]).join(''):'';
     // 历史生成耗时样本（2026-09-23 加）：用于给轮询节奏与耐心上限提供依据。
     // 实测同一会话内生成耗时可从 4.5s 到 274s（方差极大），所以它**不能用来预测**
     // 本轮要多久，只能用来判断"已经等得比历史最久还长了"这类异常。
-    const us=Object.values(j.mapping||{}).map(n=>n&&n.message)
-             .filter(m=>m&&m.author&&m.author.role==='user'&&typeof m.create_time==='number')
-             .map(m=>m.create_time).sort((a,b)=>a-b);
-    const as=fin.filter(m=>typeof m.create_time==='number').map(m=>m.create_time).sort((a,b)=>a-b);
+    const us=byTime.filter(m=>m.author.role==='user'&&typeof m.create_time==='number').map(m=>m.create_time);
+    const as=fin.filter(m=>typeof m.create_time==='number').map(m=>m.create_time);
     const gen=[];
     for(let i=0;i<Math.min(us.length,as.length);i++){ const d=as[i]-us[i]; if(d>0) gen.push(+d.toFixed(1)); }
-    return JSON.stringify({n:fin.length,len:txt.length,text:txt,gen_seconds:gen});
+    // ── 进行中的回答（2026-09-23 加）────────────────────────────────────────
+    // 用于"先部分获取"：不等它收尾，把当前已生成的部分取回来（调用方必须标注为不完整）。
+    const asstText=byTime.filter(m=>m.author.role==='assistant' && isText(m));
+    const newest=asstText[asstText.length-1];
+    const partialText=(newest && newest.end_turn!==true) ? ((newest.content.parts||[]).join('')) : '';
+    // ── 工具/搜索活动（2026-09-23 加）───────────────────────────────────────
+    // ChatGPT 联网搜索期间会先插 tool 角色的消息，这段时间答案根本不会增长；
+    // 此处把"本轮是否出现工具活动"报给调用方，让它**别在搜索期间一直轮询**。
+    const toolMsgs=byTime.filter(m=>m.author.role==='tool');
+    return JSON.stringify({n:fin.length,len:txt.length,text:txt,gen_seconds:gen,
+                           partial_len:partialText.length,partial_text:partialText,
+                           tool_count:toolMsgs.length});
   }catch(e){ return JSON.stringify({error:String(e)}) }
 })()
 "@
@@ -74,29 +85,51 @@ function Test-NewAnswer {
 function Get-PollDelayMs {
   # 下一次轮询前应该等多久（纯函数，不碰浏览器，由 tools\selftest.ps1 表驱动覆盖）。
   #
-  # 为什么要改（2026-09-23）：原实现是"前 40 次固定 1.2s、之后固定 2.5s"，
-  # 默认 TimeoutSec=360 时**一轮要打约 165 次接口请求**；而生成耗时方差极大
-  # （本会话实测 4.5s / 7.3s / 50.5s / 274s），其中绝大多数请求注定读到"还没好"。
-  # 一旦后端开始限流（429），仍按原速重试会把压力放大，现象是**会话页本身
-  # 加载不出来**（另开一个聊天页反而正常）。
+  # 演进（两个阶段，都是被实测逼出来的）：
+  #   ① 原实现"前 40 次 1.2s、之后 2.5s"，默认 TimeoutSec=360 下单轮约 165 次请求；
+  #      生成耗时实测方差极大（4.5s / 7.3s / 50.5s / 274s），多数请求注定读到"还没好"。
+  #   ② 只加几何退避（起始 1s、上限 20s）**仍然不够**：用户实测在长回合里被限流到
+  #      页面提示 "too many requests"，会话页直接打不开。原因是上限太低，而且
+  #      **联网搜索期间答案根本不会增长**，那段时间轮询纯属白打。
   #
-  # 设计：**几何退避**。早期必须仍然快——最快的答案 4.5s 就出现了，不能被拖慢；
-  # 之后每两次翻一倍直到上限。按此节奏，360s 内约 25 次请求（原 165 次，降约 85%），
-  # 而命中快答案的时间几乎不变。
-  #
-  # 为什么**不用**历史耗时去"预测"本轮要多久：实测方差 4.5s~274s，均值没有预测力；
-  # 按均值把早期轮询推迟，反而会拖慢快答案。历史耗时只用于判断异常（见 ask-gpt.ps1
-  # 里"超过历史最久还没出"的告警）。
+  # 现在：起始 2s（最快的答案 4.5s 出现，2s 起步仍能命中）、上限 60s；
+  #      搜索中/停滞时进一步放宽；429 退避可到 120s。
+  #      600s 预算内约 18 次请求（对比原约 165 次）。
   param(
     [int]$Iter,
     [int]$BackoffMs = 0,
-    [int]$StartMs = 1000,
-    [int]$CapMs = 20000
+    [bool]$Searching = $false,
+    [int]$StallCount = 0,
+    [int]$StartMs = 2000,
+    [int]$CapMs = 60000
   )
-  if ($BackoffMs -gt 0) { return [int][Math]::Min($BackoffMs, $CapMs) }   # 429 退避优先，且不超上限
+  # 429 退避优先：限流期间是**服务端在拒绝**，此时轮询毫无意义，允许退得更久。
+  if ($BackoffMs -gt 0) { return [int][Math]::Min($BackoffMs, 120000) }
   if ($Iter -lt 1) { $Iter = 1 }
-  $step = [Math]::Floor(($Iter - 1) / 2)      # 1,1,2,2,4,4,8,8,16,16,20,20,…
-  return [int][Math]::Min($StartMs * [Math]::Pow(2, $step), $CapMs)
+  $step = [Math]::Floor(($Iter - 1) / 2)      # 2,2,4,4,8,8,16,16,32,32,60,60,…
+  $d = [int][Math]::Min($StartMs * [Math]::Pow(2, $step), $CapMs)
+  # 联网搜索阶段：答案不会增长，等久一点完全无损（用户明确要求"搜索时别一直轮询"）。
+  if ($Searching) { $d = [Math]::Max($d, 30000) }
+  # 进行中但正文连续多次没有增量 → 大概率仍在搜索/长思考，进一步放宽。
+  if ($StallCount -ge 3) { $d = [Math]::Max($d, 45000) }
+  return [int][Math]::Min($d, 120000)
+}
+
+function Test-PartialAnswer {
+  # 判定"进行中的回答"是否可作为**部分结果**取回（纯函数，表驱动）。
+  # 只在没等到完整回答、且已经等够了才用；调用方必须把它标注为不完整。
+  #   NotReady  —— 还没有任何可取的正文或与基线相同（等于没进展）
+  #   Partial   —— 有正文且与基线不同，可以取回
+  param(
+    [string]$PartialText = '',
+    [string]$BaseText = '',
+    [double]$ElapsedS = 0,
+    [double]$MinElapsedS = 60
+  )
+  if ($ElapsedS -lt $MinElapsedS) { return 'not-ready' }
+  if (-not $PartialText -or $PartialText.Length -eq 0) { return 'not-ready' }
+  if ($BaseText -and $PartialText -eq $BaseText) { return 'not-ready' }
+  return 'partial'
 }
 
 function Get-ChatListJs {
