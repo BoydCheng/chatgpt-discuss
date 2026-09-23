@@ -765,6 +765,51 @@ if ($login -eq 'in') {
 
 # ============================ 4. 填入 + 发送 ============================
 
+# ── 发送前建立"本轮之前的最后一条完成回答"基线 ──────────────────────────────
+# 为什么必须**在发送前**、且必须成功（2026-09-23 实测缺陷，连续两轮命中）：
+#   本轮答案是否为新，靠 `n > baseN` 判定。原实现把基线读取放在**发送之后**，
+#   且读失败时 `$baseN` 静默保留默认值 0 —— 于是后端 HTTP 429 时 `n > 0` 对
+#   **任何已存在**的回答都成立，脚本把上一轮的回答当成这一轮的结果写进文档，
+#   而且全程不报错（Q2 记成 Q1 的逐字副本、Q3 记成 Q2 的副本，靠翻会话接口才发现）。
+#   根因不是"读失败"，而是"读失败被当成了基线为 0"。
+# 所以：**续聊模式下基线是发送的前置条件**——拿不到就不发问，让调用方稍后重试，
+# 而不是发出去之后猜。新建模式（-New）的会话此刻还不存在，基线天然为 0，无需读。
+$baseN = 0; $baseText = ''; $baseKnown = $true; $expectedS = 0
+if ($convId) {
+  # 只试 2 次、间隔 10s —— **刻意不做递进重试**（2026-09-23 修正）：
+  # 基线读失败几乎总是后端 429（限流），此时连环重试等于在限流期间加压，
+  # 会把"会话页加载不出来"这类后果放大。首版曾写成 6 次递进（3/6/9/12/15s，
+  # 累计约 45s 的连续请求），实测就是在 429 期间又打了 6 发，已改掉。
+  # 语义仍不变：拿不到基线就 Fail 16 不发问，把"何时重试"交回调用方。
+  $bl = $null
+  for ($bi = 1; $bi -le 2; $bi++) {
+    $bl = Get-ConversationState -S $Session -ConvId $convId
+    if ($bl -and -not $bl.error) { break }
+    $bl = $null
+    if ($bi -lt 2) { Start-Sleep -Seconds 10 }
+  }
+  if (-not $bl) {
+    Fail 16 "无法读取会话基线（后端限流 429 / 标签异常）。为避免把上一轮的回答误记为本轮结果，本次**未发送**；稍后重跑同一命令即可。"
+  }
+  $baseN = [int]$bl.n
+  $baseText = [string]$bl.text
+  # 历史生成耗时（同一会话内各轮 assistant.create_time − user.create_time）。
+  # 用途只有一个：判断"这轮已经等得比历史最久还长了"（异常），**不用于预测**本轮耗时
+  # —— 实测方差极大（4.5s / 7.3s / 50.5s / 274s），按均值推迟早期轮询反而会拖慢快答案。
+  if ($bl.PSObject.Properties['gen_seconds'] -and $bl.gen_seconds) {
+    $samples = @($bl.gen_seconds | ForEach-Object { [double]$_ })
+    if ($samples.Count -gt 0) { $expectedS = ($samples | Measure-Object -Maximum).Maximum }
+  }
+  if ($baseN -gt 0) { Write-Warning "基线: 会话内已有 $baseN 条完成回答（本轮须出现第 $($baseN + 1) 条且正文不同才算新答案）" }
+  if ($expectedS -gt 0) {
+    Write-Warning "历史生成耗时: 最长 $([int]$expectedS)s（共 $($bl.gen_seconds.Count) 轮样本）"
+    # 余量提醒：TimeoutSec 若与历史最长耗时太接近，超时是迟早的事，先说清楚。
+    if ($expectedS -gt 0.6 * $TimeoutSec) {
+      Write-Warning "⚠ TimeoutSec=$TimeoutSec 相对历史最长 $([int]$expectedS)s 余量不足六成——本轮很可能超时。可加 -TimeoutSec $([int]($expectedS * 2)) 重跑"
+    }
+  }
+}
+
 # 发送前记下"当前最后一条回答"：仅用于接口失效时退回 DOM 的兜底比对
 $a0text = ''
 try { $t0 = Get-LastAnswerText $Session; if ($t0) { $a0text = [string]$t0 } } catch {}
@@ -817,19 +862,24 @@ if (-not $convId) {
 # 只有跳转 URL 还依赖 DOM（读 location.href 是可靠的）。
 
 $answer = $null
-$baseN = 0
-if ($convId) {
-  $st0 = Get-ConversationState -S $Session -ConvId $convId
-  if ($st0 -and -not $st0.error) { $baseN = [int]$st0.n }
-}
+# 基线（$baseN / $baseText / $baseKnown）已在第 4 节**发送前**建立，此处不再重读——
+# 发送后再读会引入竞态：这一读可能已经包含新答案，也可能因限流返回陈旧值，
+# 两种都会让"新答案判定"失去依据（旧实现正是这么错的，见第 4 节注释）。
 $recoverCount = 0; $lastRecover = (Get-Date).AddMinutes(-10)
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
-$iter = 0; $apiErr = 0; $stallWarned = $false
+$iter = 0; $apiErr = 0; $stallWarned = $false; $pastMaxWarned = $false
+# 429 感知退避（2026-09-23 加）：本循环在生成期间每 1.2~2.5s 读一次接口，6 分钟
+# 可达约 200 次请求；一旦后端开始限流（HTTP 429），按原速重试等于持续加压 ——
+# 现象就是**会话页本身加载不出来**（新开一个聊天页反而正常）。被限流时改为指数退避，
+# 成功一次即复位。只改节奏、不改判定。
+$apiBackoffMs = 0
 $tStart = Get-Date
 
 while ((Get-Date) -lt $deadline) {
   $iter++
-  $ms = if ($iter -le 40) { 1200 } else { 2500 }
+  # 轮询节奏由 Get-PollDelayMs 统一决定（几何退避 + 429 优先），见该函数注释里的
+  # 请求量测算：默认 360s 下由约 165 次降到约 25 次。
+  $ms = Get-PollDelayMs -Iter $iter -BackoffMs $apiBackoffMs
   Start-Sleep -Milliseconds $ms
 
   # 新建轮：先用 location.href 把会话 id 钉下来（URL 读取可靠，不受渲染影响）
@@ -844,7 +894,14 @@ while ((Get-Date) -lt $deadline) {
   $st = Get-ConversationState -S $Session -ConvId $convId
   if (-not $st -or $st.error) {
     $apiErr++
-    if ($apiErr -le 2) { Write-Warning ("读取会话失败: " + $(if ($st) { $st.error } else { "无响应" })) }
+    $errText = if ($st) { $st.error } else { "无响应" }
+    if ($apiErr -le 2) { Write-Warning ("读取会话失败: " + $errText) }
+    # 限流 → 指数退避（3s→6s→…→上限 20s），并明确告诉调用方这是服务端限流、
+    # 不是标签坏了，避免被误导去"重开标签"而把问题弄复杂。
+    if ("$errText" -match '429') {
+      $apiBackoffMs = if ($apiBackoffMs -le 0) { 3000 } else { [Math]::Min($apiBackoffMs * 2, 20000) }
+      if ($apiErr -le 3) { Write-Warning "后端限流（429）——退避到 $([int]($apiBackoffMs / 1000))s 再读；这是服务端限流，不是标签问题" }
+    }
     # 读不到（标签丢了 / 页面在导航）→ 限量恢复，绝不在循环里反复开标签
     if ($script:ConvKind -eq 'uc') {
       # 匿名会话的 URL 不是身份：重开只会得到一条新对话，所以只报告、不恢复
@@ -858,10 +915,25 @@ while ((Get-Date) -lt $deadline) {
     continue
   }
 
-  if ([int]$st.n -gt $baseN -and "$($st.text)".Length -gt 0) { $answer = [string]$st.text; break }
+  $apiBackoffMs = 0   # 读到一次就复位退避，恢复正常轮询节奏
+  $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
+                            -N ([int]$st.n) -Text ([string]$st.text)
+  if ($verdict -eq 'new') { $answer = [string]$st.text; break }
+  if ($verdict -eq 'stale-same-text' -and -not $stallWarned) {
+    $stallWarned = $true
+    Write-Warning ("读到的最后一条完成回答（n=$($st.n)）与本轮之前的基线正文逐字相同——" +
+                   "判为旧回答、继续等；这通常是后端限流把陈旧响应返回了，不要当成新答案")
+  }
   if (-not $stallWarned -and $iter -ge 60) {
     $stallWarned = $true
     Write-Warning "60s 仍未出现新的完成消息（生成很慢？）——继续等，不刷新"
+  }
+  # 已超过历史最久的一轮还没出结果 → 说清楚这属于异常（限流 / 卡住），
+  # 而不是继续用"生成很慢"含糊描述，避免调用方误以为再等就好。
+  if (-not $pastMaxWarned -and $expectedS -gt 0 -and ((Get-Date) - $tStart).TotalSeconds -gt $expectedS) {
+    $pastMaxWarned = $true
+    Write-Warning ("已等待 $([int]((Get-Date) - $tStart).TotalSeconds)s，超过本会话历史最长生成耗时 $([int]$expectedS)s" +
+                   "——按历史这不正常，优先怀疑后端限流或本轮生成长度显著更大；继续等，但不要据此判断设备/脚本有问题")
   }
 }
 $elapsedWait = [int]((Get-Date) - $tStart).TotalSeconds
@@ -871,7 +943,14 @@ if (-not $answer) {
   Write-Warning "生成超时（已等 ${elapsedWait}s），最后再读一次接口"
   if ($convId) {
     $st = Get-ConversationState -S $Session -ConvId $convId
-    if ($st -and -not $st.error -and [int]$st.n -gt $baseN -and "$($st.text)".Length -gt 0) { $answer = [string]$st.text }
+    if ($st -and -not $st.error) {
+      $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
+                                -N ([int]$st.n) -Text ([string]$st.text)
+      if ($verdict -eq 'new') { $answer = [string]$st.text }
+      elseif ($verdict -eq 'stale-same-text') {
+        Write-Warning "最后一次读取拿到的仍是基线正文（陈旧响应），不作为本轮答案"
+      }
+    }
   }
 }
 if (-not $answer) {
@@ -901,6 +980,17 @@ if (-not $answer) {
 }
 
 # ============================ 6. 写文档 + 固化状态 ============================
+
+# ── 写入前的最后防线（2026-09-23）────────────────────────────────────────────
+# 上面每条取答案的路径都过了 Test-NewAnswer，唯独"DOM 兜底"只与**发送前的 DOM 文本**
+# 比对过（DOM 可能被截断，比对不可靠）。这里是归档的最后一个关口，必须再挡一次：
+# 若即将写入的正文与**发送前接口基线正文**逐字相同，那它就是上一轮的回答，
+# 宁可失败也绝不写进档案——档案是当证据用的，静默写错比失败严重得多。
+if ($baseKnown -and $baseText -and $answer -eq $baseText) {
+  Fail 9 ("取到的回答与发送前的基线正文逐字相同，判定为上一轮的回答、拒绝写入档案。" +
+          "注意：本次提问**已经发出**（不要盲目重跑，否则会重复提问）；" +
+          "请先核对 " + $(if ($convId) { (New-ConvUrl $convId) } else { '该会话' }) + " 里本轮是否已有回答")
+}
 
 $anchorFinal = if ($convId) { (New-ConvUrl $convId) } elseif ($anchor) { $anchor } else { "unknown" }
 

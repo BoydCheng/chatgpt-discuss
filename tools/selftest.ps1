@@ -5,6 +5,8 @@
 .DESCRIPTION
   三部分：
     A. 静态检查：对真实脚本跑 lint.ps1（必须 0 ERROR）
+       A2 锚点纯函数表驱动；A3 新答案判定表驱动（含 2026-09-23 静默写错档案的回归）；
+       A4 轮询节奏表驱动 + 360s 内总请求量性质断言（治 429 加压 / 页面加载不出来）
     B. 检查器自证：对故意注入坑的样本跑 lint.ps1（必须抓到 ≥6 项）
     C. 离线行为：只测不碰浏览器的路径（用不可达 daemon 逼它提前失败），校验退出码
        T1 -Status 空状态            → 0
@@ -79,6 +81,64 @@ foreach ($c in $anchorCases) {
   if ((Get-ConvKind $c.url) -ne $c.kind) { $a2bad += "Get-ConvKind($($c.url))" }
 }
 Add-Result "A2 锚点纯函数（c/uc/openai/非法）" ($a2bad.Count -eq 0) $(if ($a2bad.Count) { "失败: " + ($a2bad -join '; ') } else { "5 组用例全过" })
+
+Write-Host ""
+Write-Host "=== A3. 新答案判定（纯函数，表驱动） ===" -ForegroundColor Cyan
+# 这一组覆盖 2026-09-23 的**静默写错档案**缺陷：基线读取失败（后端 429）时，
+# 旧实现把 `n > baseN` 里的 baseN 当成 0，于是任何**已存在**的回答都被判成本轮新答案。
+# 下面第 3、4 条就是那个回归——它们必须**不**返回 new。
+$apiLib = Join-Path $SkillDir "scripts\lib\chatgpt-api.ps1"
+. $apiLib
+$verdictCases = @(
+  @{ name = '基线可信/n未涨(还在生成)'; p = @{ BaseN = 1; BaseText = 'A1'; BaseKnown = $true;  N = 1; Text = 'A1' }; want = 'not-yet' }
+  @{ name = '基线可信/n涨/正文不同';    p = @{ BaseN = 1; BaseText = 'A1'; BaseKnown = $true;  N = 2; Text = 'A2' }; want = 'new' }
+  @{ name = '回归:基线不可信+n>0';      p = @{ BaseN = 0; BaseText = '';   BaseKnown = $false; N = 1; Text = 'A1' }; want = 'unknown-baseline' }
+  @{ name = '回归:基线不可信+n=3';      p = @{ BaseN = 0; BaseText = '';   BaseKnown = $false; N = 3; Text = 'A3' }; want = 'unknown-baseline' }
+  @{ name = 'n涨但正文与基线逐字同';     p = @{ BaseN = 1; BaseText = 'A1'; BaseKnown = $true;  N = 2; Text = 'A1' }; want = 'stale-same-text' }
+  @{ name = '首轮提问(base=0)';         p = @{ BaseN = 0; BaseText = '';   BaseKnown = $true;  N = 1; Text = 'A1' }; want = 'new' }
+  @{ name = 'n涨但正文为空';            p = @{ BaseN = 0; BaseText = '';   BaseKnown = $true;  N = 1; Text = ''   }; want = 'empty' }
+)
+$a3bad = @()
+foreach ($c in $verdictCases) {
+  $pp = $c.p
+  $got = Test-NewAnswer @pp
+  if ($got -ne $c.want) { $a3bad += "$($c.name): 期望 $($c.want) 实得 $got" }
+}
+Add-Result "A3 新答案判定（含静默写错回归）" ($a3bad.Count -eq 0) $(if ($a3bad.Count) { "失败: " + ($a3bad -join '; ') } else { "$($verdictCases.Count) 组用例全过" })
+
+Write-Host ""
+Write-Host "=== A4. 轮询节奏（纯函数 + 请求量性质断言） ===" -ForegroundColor Cyan
+# 旧实现"前 40 次 1.2s、之后 2.5s"在默认 TimeoutSec=360 下一轮约 165 次请求；
+# 被 429 后仍按原速重试，压力会被放大。这里既钉住单点值，也钉住**总请求量**。
+$delayCases = @(
+  @{ name = '第1次(最快答案要能命中)'; p = @{ Iter = 1 };                          want = 1000 }
+  @{ name = '第2次';                   p = @{ Iter = 2 };                          want = 1000 }
+  @{ name = '第3次翻倍';               p = @{ Iter = 3 };                          want = 2000 }
+  @{ name = '第5次';                   p = @{ Iter = 5 };                          want = 4000 }
+  @{ name = '第9次';                   p = @{ Iter = 9 };                          want = 16000 }
+  @{ name = '第11次到上限';            p = @{ Iter = 11 };                         want = 20000 }
+  @{ name = '很多次仍在上限';          p = @{ Iter = 100 };                        want = 20000 }
+  @{ name = 'Iter=0 视作1';            p = @{ Iter = 0 };                          want = 1000 }
+  @{ name = '429退避优先';             p = @{ Iter = 1; BackoffMs = 3000 };        want = 3000 }
+  @{ name = '429退避也不超上限';       p = @{ Iter = 1; BackoffMs = 99999 };       want = 20000 }
+)
+$a4bad = @()
+foreach ($c in $delayCases) {
+  $pp = $c.p
+  $got = Get-PollDelayMs @pp
+  if ($got -ne $c.want) { $a4bad += "$($c.name): 期望 $($c.want) 实得 $got" }
+}
+Add-Result "A4a 轮询间隔表驱动" ($a4bad.Count -eq 0) $(if ($a4bad.Count) { "失败: " + ($a4bad -join '; ') } else { "$($delayCases.Count) 组用例全过" })
+
+# 性质断言：默认 TimeoutSec=360 内的总请求次数必须远低于旧设计（旧约 165 次）
+$total = 0; $polls = 0; $budget = 360
+while ($total -lt $budget) {
+  $polls++
+  $total += (Get-PollDelayMs -Iter $polls) / 1000.0
+}
+Add-Result "A4b 360s 内请求数 ≤40（旧约165）" ($polls -le 40) "$polls 次"
+$firstHit = (Get-PollDelayMs -Iter 1) / 1000.0
+Add-Result "A4c 首次轮询仍 ≤1.5s（不拖慢快答案）" ($firstHit -le 1.5) "$firstHit s"
 
 Write-Host ""
 Write-Host "=== B. 检查器自证（故意注入坑的样本）===" -ForegroundColor Cyan
