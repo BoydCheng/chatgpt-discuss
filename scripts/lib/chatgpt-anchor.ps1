@@ -25,9 +25,14 @@ function New-ConvUrl {
 function Get-ConvId {
   param([string]$Url)
   if (-not $Url) { return $null }
-  $m = [regex]::Match($Url, 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
+  # 会话 id 必须匹配 UUID 形态（8-4-4-4-12）。
+  # 只要求"8 位以上字母数字/短横"是不够的：前端在服务端分配 id 之前会短暂显示客户端
+  # 占位符（实测 https://chatgpt.com/c/local-chatgpt，13 位、全 [a-z-]，正好通过旧正则）。
+  # 一旦把占位符记成锚点，后续所有接口读取都会打在不存在的会话上（HTTP 400），
+  # 并被判成"标签读不到"而反复重开——整轮白跑且不写文档。
+  $m = [regex]::Match($Url, 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z]{8}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{12})')
   if ($m.Success) { return $m.Groups[1].Value }
-  $m = [regex]::Match($Url, 'chat\.openai\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
+  $m = [regex]::Match($Url, 'chat\.openai\.com/(?:c|uc)/([0-9a-zA-Z]{8}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{12})')
   if ($m.Success) { return $m.Groups[1].Value }
   return $null
 }

@@ -120,10 +120,11 @@ foreach ($root in $Roots) {
       if ($_.FullName -notlike $Only) { return }
       $txt = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
       $cid = $null
-      $mk = [regex]::Match($txt, 'chatgpt-discuss:.*?conv=https://chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
+      # 同 chatgpt-anchor.ps1：必须 UUID 形态，否则会认领前端占位符（如 c/local-chatgpt）
+      $mk = [regex]::Match($txt, 'chatgpt-discuss:.*?conv=https://chatgpt\.com/(?:c|uc)/([0-9a-zA-Z]{8}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{12})')
       if ($mk.Success) { $cid = $mk.Groups[1].Value }
       if (-not $cid) {
-        $lm = [regex]::Match($txt.Substring(0, [Math]::Min(3000, $txt.Length)), 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z\-]{8,})')
+        $lm = [regex]::Match($txt.Substring(0, [Math]::Min(3000, $txt.Length)), 'chatgpt\.com/(?:c|uc)/([0-9a-zA-Z]{8}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{12})')
         if ($lm.Success) { $cid = $lm.Groups[1].Value }
       }
       # 分类：脚本型（脚本自动落盘，含 **Q:** / **A:**）vs 汇总型（AI 手工整理，含要点/完整原文）

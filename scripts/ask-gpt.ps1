@@ -498,7 +498,8 @@ if (-not $anchor) {
   $txt = Read-Text $DocPath
   if ($txt) {
     $head = if ($txt.Length -gt 2000) { $txt.Substring(0, 2000) } else { $txt }
-    $m = [regex]::Match($head, 'chatgpt\.com/(c|uc)/([0-9a-zA-Z\-]{8,})')
+    # 同 chatgpt-anchor.ps1：必须 UUID 形态，否则会认领前端占位符（如 c/local-chatgpt）
+    $m = [regex]::Match($head, 'chatgpt\.com/(c|uc)/([0-9a-zA-Z]{8}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{4}-[0-9a-zA-Z]{12})')
     if ($m.Success) {
       $anchor = "https://chatgpt.com/$($m.Groups[1].Value)/$($m.Groups[2].Value)"
       $anchorSrc = "文档(旧格式链接)"

@@ -71,7 +71,11 @@ $anchorLib = Join-Path $SkillDir "scripts\lib\chatgpt-anchor.ps1"
 $anchorCases = @(
   @{ url='https://chatgpt.com/c/6aa00000-0000-0000-0000-000000000000';  id='6aa00000-0000-0000-0000-000000000000'; kind='c';  canon='https://chatgpt.com/c/6aa00000-0000-0000-0000-000000000000' }
   @{ url='https://chatgpt.com/uc/6aafb7c5-c2a8-83ea-ae37-3b148929c03c'; id='6aafb7c5-c2a8-83ea-ae37-3b148929c03c'; kind='uc'; canon='https://chatgpt.com/uc/6aafb7c5-c2a8-83ea-ae37-3b148929c03c' }
-  @{ url='https://chat.openai.com/c/abc12345-x';  id='abc12345-x'; kind='c';  canon='https://chatgpt.com/c/abc12345-x' }
+  @{ url='https://chat.openai.com/c/6ab00000-1111-2222-3333-444444444444'; id='6ab00000-1111-2222-3333-444444444444'; kind='c';  canon='https://chatgpt.com/c/6ab00000-1111-2222-3333-444444444444' }
+  # 回归（2026-09-28）：前端在服务端分配 id 之前会短暂显示客户端占位符。旧正则
+  # （8 位以上 [0-9a-zA-Z-]）会把它认成锚点，之后所有接口读取都打在不存在的会话上
+  # （HTTP 400）并被判成"标签读不到"而反复重开——整轮白跑且不写文档。必须判为非法。
+  @{ url='https://chatgpt.com/c/local-chatgpt';   id=$null;         kind='c';  canon=$null }
   @{ url='https://chatgpt.com/';                  id=$null;         kind='c';  canon=$null }
   @{ url='not-a-url';                             id=$null;         kind='c';  canon=$null }
 )
@@ -81,7 +85,7 @@ foreach ($c in $anchorCases) {
   if ((Get-CanonicalConvUrl $c.url) -ne $c.canon) { $a2bad += "Get-CanonicalConvUrl($($c.url))" }
   if ((Get-ConvKind $c.url) -ne $c.kind) { $a2bad += "Get-ConvKind($($c.url))" }
 }
-Add-Result "A2 锚点纯函数（c/uc/openai/非法）" ($a2bad.Count -eq 0) $(if ($a2bad.Count) { "失败: " + ($a2bad -join '; ') } else { "5 组用例全过" })
+Add-Result "A2 锚点纯函数（c/uc/openai/占位符/非法）" ($a2bad.Count -eq 0) $(if ($a2bad.Count) { "失败: " + ($a2bad -join '; ') } else { "6 组用例全过" })
 
 Write-Host ""
 Write-Host "=== A3. 新答案判定（纯函数，表驱动） ===" -ForegroundColor Cyan

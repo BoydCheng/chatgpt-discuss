@@ -14,6 +14,22 @@ metadata:
 
 ---
 
+## 调用方式：交给 subagent，不要在前台直呼
+
+**在具备 subagent / 后台任务能力的 harness 里，把 `ask-gpt.ps1` 的调用交由 subagent 执行，不要占用前台。**
+
+单轮生成耗时可达数百秒（实测 4.5s ~ 274s），`-TimeoutSec` 默认 360s；前台直呼会被长时间占住，期间用户看不到进展也无法插话。
+
+**交给 subagent 时必须交代清三件事**：
+
+1. **原样转发**脚本、参数、`-Session`、`-DocPath` —— 不要让 subagent 自行改 session 名或文档路径。
+2. **串行**：同一 session 不得并发（脚本有锁，并发会被 `exit 12` 拒绝）。
+3. **回报内容** = 回答全文 + 退出码 + 会话链接；退出码按「退出码表」处理，不要换 session 名绕开。
+
+**例外**：`-Status` / `-ListChats` 这类只读、不碰浏览器、秒回的命令，前台直接跑即可。
+
+---
+
 ## 身份模型（先读懂这段，否则一定会开出一堆重复对话）
 
 > **一个讨论 = 一条 ChatGPT 会话**：登录态是 `https://chatgpt.com/c/<uuid>`，未登录态是 `https://chatgpt.com/uc/<id>`。
